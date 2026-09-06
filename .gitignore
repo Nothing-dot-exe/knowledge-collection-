@@ -1,0 +1,32 @@
+# PDF & binary downloads
+raw_pdfs/
+*.pdf
+
+# Runtime logs
+logs/
+*.log
+
+# Python cache & build
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Configuration & Secrets
+.env
+.dashboard_config.json
+
+# Operating System & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.ipynb_checkpoints/
