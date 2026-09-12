@@ -40,12 +40,19 @@ for _mod, _pkg in [
     ("thefuzz", "thefuzz>=0.22.0"),
     ("requests", "requests>=2.28.0"),
     ("dotenv", "python-dotenv>=1.0.0"),
+    ("nest_asyncio", "nest-asyncio>=1.6.0"),
 ]:
     try:
         __import__(_mod)
     except ImportError:
         print(f"📦 Installing required package '{_pkg}'...", flush=True)
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", _pkg])
+
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except Exception:
+    pass
 
 # Load environment variables if .env exists
 try:
@@ -1328,6 +1335,19 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        import nest_asyncio
+        nest_asyncio.apply()
+    except Exception:
+        pass
+
+    try:
         asyncio.run(main())
+    except RuntimeError as re:
+        if "running event loop" in str(re).lower():
+            # Fallback for Jupyter / Colab notebooks
+            loop = asyncio.get_event_loop()
+            loop.create_task(main())
+        else:
+            raise
     except (KeyboardInterrupt, SystemExit):
         log.info("Shutdown initiated by user.")
