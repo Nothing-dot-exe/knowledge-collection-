@@ -1,5 +1,7 @@
 {
   "papers": [
+    "tg_Mathematics for Machine Learning by Stanford University.pdf",
+    "tg_math-for-ai.pdf",
     "2609.09143",
     "2609.10745",
     "2609.10445",
@@ -23,6 +25,8 @@
     "2609.10712"
   ],
   "hashes": [
+    "486adb2c1931ff053e79ce6109b0954226bb8b631a527924ab86557d3593c388",
+    "5ac6fe5f3bef09b211c0eecdaa6c528b0811ea5133a2c7a071cef647010ceb29",
     "008aefeae5b05e798f1a0cf6c30774f79c6b20f9655cdeaf1a5f99453d8e7061",
     "296a02e7121b45629345f37481b5d6eeccd9e02489d661fcd2f60620b51b76b8",
     "b6d5bf445b672f21e32dfb8cdfdb7a494e362db0521a398be54a9c722679fe91",
@@ -46,6 +50,8 @@
     "52c198a13061df66165d0d501d945211d17f2cbdd7add8cee9db4d7103fff875"
   ],
   "titles": [
+    "Review Notes and Supplementary Notes CS229 Course Machine Learning Standford University",
+    "人工智能的数学基础",
     "Studying Image Tokenizers as Visual Languages in Unified Multimodal Models",
     "Think Before You Link: Rarity, Reasoning, and Retrieval in Multilingual Entity Linking",
     "Building Multilingual Bridges: Data Mixing as the Pillar of Generalization for In-Language Reasoning",

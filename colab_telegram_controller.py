@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 import subprocess
 import sys
 
@@ -190,11 +191,69 @@ state = AgentState()
 #  REGISTRY & DEDUPLICATION LOGIC
 # ══════════════════════════════════════════════════════════════════════════════
 
+def clean_title_from_filename(filename: str) -> str:
+    """Extract and normalize document title from the PDF filename."""
+    stem = Path(filename).stem
+    # Strip prefixes like tg_, ch_, doc_, or leading index numbers
+    stem = re.sub(r"^(tg_|ch_|doc_|\d+[\._\-\s]+)", "", stem, flags=re.IGNORECASE)
+    # Strip common site watermarks and bracketed tags
+    stem = re.sub(r"\s*[\(\[\{].*?(?:pdfdrive|z-lib|libgen|download|ebook|scan|watermark).*?[\)\]\}]", "", stem, flags=re.IGNORECASE)
+    # Replace underscores and hyphens with spaces
+    stem = stem.replace("_", " ").replace("-", " ")
+    # Collapse multiple whitespace
+    stem = re.sub(r"\s+", " ", stem).strip(" .-_")
+    return stem
+
+
+def extract_clean_title(clean_md: str, filename: str) -> str:
+    """Extract genuine document title, filtering out image tags, comments, and OCR artifacts."""
+    fallback = clean_title_from_filename(filename)
+    if not fallback or len(re.findall(r"[a-zA-Z0-9]", fallback)) < 2:
+        fallback = "Document"
+
+    lines = [line.strip() for line in clean_md.splitlines() if line.strip()]
+    invalid_patterns = [
+        r"^<!\-\-", r"^<[^>]+>$", r"^!\[", r"^\[\s*\]", r"^[-=*_#\s|]+$",
+        r"^(table of contents|contents|index|chapter|preface|copyright|acknowledgments|license|edition)",
+        r"^(image|figure|table|chart|diagram|photo|pic|picture|untitled|cover|page\s*\d+)",
+        r"^(https?://|www\.|doi:|arxiv:)"
+    ]
+
+    detected_title = None
+    for line in lines[:40]:
+        text = re.sub(r"^#{1,6}\s*", "", line).strip()
+        text = re.sub(r"<!--.*?-->", "", text).strip()
+        text = re.sub(r"<[^>]+>", "", text).strip()
+        text = re.sub(r"[*_~`]", "", text).strip()
+        if not text:
+            continue
+        lower = text.lower()
+        if any(re.search(p, lower) for p in invalid_patterns):
+            continue
+        letters = re.findall(r"[a-zA-Z]", text)
+        if len(letters) < 4:
+            continue
+        if len(text.split()) > 20 or text.endswith((".", ";", ":")):
+            continue
+        if 5 <= len(text) <= 120:
+            detected_title = text
+            break
+
+    is_generic_fn = any(fallback.lower() == g for g in ("document", "paper", "book", "file", "download", "untitled"))
+    if detected_title and is_generic_fn:
+        return detected_title
+    if len(fallback) >= 6 and not is_generic_fn:
+        return fallback
+    return detected_title or fallback
+
+
 def get_safe_filename(title: str, max_len: int = 120) -> str:
     """Generate a clean, filesystem-safe and GitHub-safe filename from document title."""
-    s = re.sub(r'[:/\\?*"<>|]', " - ", title)
-    s = re.sub(r"\s+", " ", s).strip(" .-_")
-    if not s:
+    s = re.sub(r"<!--.*?-->", "", title)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = re.sub(r'[:/\\?*"<>|!#`]', " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .-_#`!~")
+    if not s or len(re.findall(r"[a-zA-Z0-9]", s)) < 2:
         s = "Document"
     if len(s) > max_len:
         s = s[:max_len].rsplit(" ", 1)[0].strip()
@@ -267,6 +326,16 @@ def sync_github_registry(gh_token: str, gh_repo_url: str, local_reg: dict[str, l
                     merged_papers.append(p)
                     merged_hashes.append(h)
                     merged_titles.append(t)
+
+            # Purge any legacy corrupted entries where title is "<!-- image -->" or starts with "<!--"
+            clean_p, clean_h, clean_t = [], [], []
+            for p, h, t in zip(merged_papers, merged_hashes, merged_titles):
+                if t.strip() in ("<!-- image -->", "!-- image", "Document") and p.startswith("tg_"):
+                    continue
+                clean_p.append(p)
+                clean_h.append(h)
+                clean_t.append(t)
+            merged_papers, merged_hashes, merged_titles = clean_p, clean_h, clean_t
 
             local_reg["papers"] = merged_papers
             local_reg["hashes"] = merged_hashes
@@ -551,21 +620,50 @@ def synthesize_sft_reasoning_nim(text: str, kb_id: str, title: str, pairs_count:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def push_or_update_gh(repo, path: str, msg: str, content: str) -> None:
+    """Push new file or update existing file in GitHub repository with support for >1MB files."""
     for attempt in range(3):
         try:
+            sha = None
             try:
-                existing = repo.get_contents(path)
-                repo.update_file(path, msg, content, existing.sha)
-                return
+                item = repo.get_contents(path)
+                sha = item.sha if not isinstance(item, list) else None
             except GithubException as ge:
                 if ge.status == 404:
+                    sha = None
+                elif ge.status == 403:
+                    # Blob too large to fetch directly (>1MB), find SHA from parent dir listing
+                    parent = str(Path(path).parent).replace("\\", "/")
+                    fname = Path(path).name
+                    dir_path = "" if parent in (".", "") else parent
+                    dir_items = repo.get_contents(dir_path)
+                    if isinstance(dir_items, list):
+                        for it in dir_items:
+                            if it.name == fname:
+                                sha = it.sha
+                                break
+
+            if sha:
+                repo.update_file(path, msg, content, sha)
+            else:
+                try:
                     repo.create_file(path, msg, content)
-                    return
-                time.sleep(1.5)
-        except Exception:
+                except GithubException as ce:
+                    parent = str(Path(path).parent).replace("\\", "/")
+                    fname = Path(path).name
+                    dir_path = "" if parent in (".", "") else parent
+                    dir_items = repo.get_contents(dir_path)
+                    if isinstance(dir_items, list):
+                        for it in dir_items:
+                            if it.name == fname:
+                                repo.update_file(path, msg, content, it.sha)
+                                return
+                    raise ce
+            return
+        except Exception as e:
             if attempt == 2:
+                log.error("GitHub push failed permanently for %s: %s", path, e)
                 raise
-            time.sleep(1.5)
+            time.sleep(2.0)
 
 
 def generate_master_readme(reg: dict[str, list[str]], repo_url: str) -> str:
@@ -582,7 +680,8 @@ def generate_master_readme(reg: dict[str, list[str]], repo_url: str) -> str:
         t = titles[i] if i < len(titles) else "Document"
         source = papers[i]
         safe_t = get_safe_filename(t)
-        rows.append(f"| `{pid}` | [{t}](text_vault/{safe_t}.md) | `{source}` | [JSONL Dataset](dataset_vault/{safe_t}_dataset.jsonl) |")
+        url_t = quote(safe_t)
+        rows.append(f"| `{pid}` | [{t}](text_vault/{url_t}.md) | `{source}` | [JSONL Dataset](dataset_vault/{url_t}_dataset.jsonl) |")
 
     table_content = "\n".join(rows) if rows else "| - | No documents registered yet | - | - |"
 
@@ -623,11 +722,11 @@ def commit_vault_to_github(
     clean_md: str,
     dataset_content: str,
     reg: dict[str, list[str]],
-) -> bool:
+) -> tuple[bool, str]:
     """Commit Markdown, Dataset, Registry, and README to GitHub repository using actual document name."""
     if not GITHUB_TOKEN or not GITHUB_REPO_URL:
         log.warning("No GitHub credentials configured; skipping remote vault sync.")
-        return False
+        return False, "Missing credentials"
 
     repo_name = extract_repo_name(GITHUB_REPO_URL)
     safe_title = get_safe_filename(title)
@@ -669,11 +768,11 @@ def commit_vault_to_github(
             readme_str,
         )
 
-        log.info("Successfully committed %s to GitHub Vault (%s)!", kb_id, repo_name)
-        return True
+        log.info("Successfully committed %s (%s) to GitHub Vault (%s)!", kb_id, safe_title, repo_name)
+        return True, "OK"
     except Exception as e:
-        log.error("Failed to commit %s to GitHub Vault: %s", kb_id, e)
-        return False
+        log.exception("Failed to commit %s to GitHub Vault: %s", kb_id, e)
+        return False, str(e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -799,7 +898,7 @@ async def process_job(job: IngestionJob) -> None:
 
         # ── Step 2: Compute SHA-256 and Run Deduplication Check ───────────────
         pdf_hash = compute_sha256(temp_pdf)
-        raw_title = Path(job.file_name).stem.replace("_", " ").replace("-", " ")
+        raw_title = clean_title_from_filename(job.file_name)
 
         is_dup, dup_id, dup_reason = check_deduplication(pdf_hash, raw_title, state.registry)
         if is_dup:
@@ -843,17 +942,11 @@ async def process_job(job: IngestionJob) -> None:
         loop = asyncio.get_running_loop()
         clean_md, pages = await loop.run_in_executor(None, extract_pdf_with_docling, temp_pdf)
 
-        # Detect title if available in top lines
-        title = raw_title
-        first_lines = [line.strip() for line in clean_md.splitlines() if line.strip()]
-        for line in first_lines[:5]:
-            stripped = line.lstrip("#").strip()
-            if len(stripped) > 5 and not stripped.startswith("http") and not stripped.lower().startswith("arxiv"):
-                title = stripped
-                break
+        # Detect genuine document title (filters out <!-- image -->, comments, and OCR tags)
+        title = extract_clean_title(clean_md, job.file_name)
 
         words = len(clean_md.split())
-        log.info("[%s] Docling extraction complete: %d words, %d pages", kb_id, words, pages)
+        log.info("[%s] Docling extraction complete: %d words, %d pages, title: '%s'", kb_id, words, pages, title)
 
         if job.cancelled:
             return
@@ -960,7 +1053,7 @@ async def process_job(job: IngestionJob) -> None:
         save_local_registry(state.registry)
 
         # 4. Commit to GitHub Vault
-        gh_ok = await loop.run_in_executor(
+        gh_ok, gh_err = await loop.run_in_executor(
             None, commit_vault_to_github, kb_id, title, final_clean_md, dataset_content, state.registry
         )
 
@@ -970,7 +1063,7 @@ async def process_job(job: IngestionJob) -> None:
             f"<b>Title:</b> {html.escape(title)}\n\n"
             f"📊 <b>Vault Total:</b> <code>{len(state.registry['papers'])}</code> documents\n"
             f"🔒 <b>SHA-256:</b> <code>{pdf_hash}</code>\n"
-            f"🐙 <b>GitHub Vault:</b> {'✅ Committed' if gh_ok else '⚠️ Local Only'}\n"
+            f"🐙 <b>GitHub Vault:</b> {'✅ Committed' if gh_ok else f'⚠️ Failed ({html.escape(gh_err[:40])})'}\n"
             f"⏱️ <b>Timestamp:</b> <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</code>"
         )
         await send_to_topic(REGISTRY_TOPIC_ID, registry_card)
@@ -992,7 +1085,7 @@ async def process_job(job: IngestionJob) -> None:
             f"⏱️ <b>Processing Time:</b> {total_time}s (ETA was ~{job.eta_seconds}s)\n"
             f"📊 <b>Extracted:</b> {words:,} words | {pages} pages\n"
             f"🧩 <b>Dataset:</b> {len(chunks)} chunks | {len(sft_records)} SFT reasoning pairs\n"
-            f"🐙 <b>GitHub:</b> {'Pushed to repository' if gh_ok else 'Local registry'}\n\n"
+            f"🐙 <b>GitHub:</b> {'✅ Pushed to repository' if gh_ok else f'❌ Push Failed ({html.escape(gh_err[:40])})'}\n\n"
             f"📦 <b>Dispatched To:</b>\n"
             f"  • 📄 PDF -> Topic #354\n"
             f"  • 📝 Clean Text -> Topic #355\n"
@@ -1093,7 +1186,7 @@ async def scan_channel_backlog():
                 state.processed_msg_ids.add(m.id)
                 fname = m.file.name
                 fsize = m.file.size or 0
-                raw_title = Path(fname).stem.replace("_", " ").replace("-", " ")
+                raw_title = clean_title_from_filename(fname)
 
                 # Deduplication pre-check against current registry
                 is_dup, dup_id, dup_reason = check_deduplication(None, raw_title, state.registry)
@@ -1275,7 +1368,7 @@ async def message_handler(event):
     log.info("Received PDF in Topic 648: %s (%.2f MB)", file_name, size_mb)
 
     # Instant Pre-Check Deduplication against Title
-    raw_title = Path(file_name).stem.replace("_", " ").replace("-", " ")
+    raw_title = clean_title_from_filename(file_name)
     is_dup, dup_id, dup_reason = check_deduplication(None, raw_title, state.registry)
     if is_dup:
         log.info("Document '%s' already in registry (%s: %s). Skipping.", file_name, dup_id, dup_reason)

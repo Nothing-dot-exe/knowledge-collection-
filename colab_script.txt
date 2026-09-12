@@ -60,6 +60,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from github import Auth, Github, GithubException
 from telethon import Button, TelegramClient, events
@@ -216,6 +217,14 @@ def sync_github_registry(gh_token: str, gh_repo_url: str, local_reg: dict[str, l
                     merged_papers.append(p)
                     merged_hashes.append(h)
                     merged_titles.append(t)
+            clean_p, clean_h, clean_t = [], [], []
+            for p, h, t in zip(merged_papers, merged_hashes, merged_titles):
+                if t.strip() in ("<!-- image -->", "!-- image", "Document") and p.startswith("tg_"):
+                    continue
+                clean_p.append(p)
+                clean_h.append(h)
+                clean_t.append(t)
+            merged_papers, merged_hashes, merged_titles = clean_p, clean_h, clean_t
             local_reg["papers"] = merged_papers
             local_reg["hashes"] = merged_hashes
             local_reg["titles"] = merged_titles
@@ -326,29 +335,112 @@ def chunk_text(text: str, kb_id: str, title: str) -> list[dict]:
         start += 1800
     return records
 
-def push_github(repo, path: str, msg: str, content: str) -> None:
-    for _ in range(3):
-        try:
-            try:
-                exist = repo.get_contents(path)
-                repo.update_file(path, msg, content, exist.sha)
-                return
-            except GithubException as ge:
-                if ge.status == 404:
-                    repo.create_file(path, msg, content)
-                    return
-                time.sleep(1.5)
-        except Exception:
-            time.sleep(1.5)
+def clean_title_from_filename(filename: str) -> str:
+    """Extract and normalize document title from the PDF filename."""
+    stem = Path(filename).stem
+    stem = re.sub(r"^(tg_|ch_|doc_|\d+[\._\-\s]+)", "", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"\s*[\(\[\{].*?(?:pdfdrive|z-lib|libgen|download|ebook|scan|watermark).*?[\)\]\}]", "", stem, flags=re.IGNORECASE)
+    stem = stem.replace("_", " ").replace("-", " ")
+    stem = re.sub(r"\s+", " ", stem).strip(" .-_")
+    return stem
+
+def extract_clean_title(clean_md: str, filename: str) -> str:
+    """Extract genuine document title, filtering out image tags, comments, and OCR artifacts."""
+    fallback = clean_title_from_filename(filename)
+    if not fallback or len(re.findall(r"[a-zA-Z0-9]", fallback)) < 2:
+        fallback = "Document"
+
+    lines = [line.strip() for line in clean_md.splitlines() if line.strip()]
+    invalid_patterns = [
+        r"^<!\-\-", r"^<[^>]+>$", r"^!\[", r"^\[\s*\]", r"^[-=*_#\s|]+$",
+        r"^(table of contents|contents|index|chapter|preface|copyright|acknowledgments|license|edition)",
+        r"^(image|figure|table|chart|diagram|photo|pic|picture|untitled|cover|page\s*\d+)",
+        r"^(https?://|www\.|doi:|arxiv:)"
+    ]
+
+    detected_title = None
+    for line in lines[:40]:
+        text = re.sub(r"^#{1,6}\s*", "", line).strip()
+        text = re.sub(r"<!--.*?-->", "", text).strip()
+        text = re.sub(r"<[^>]+>", "", text).strip()
+        text = re.sub(r"[*_~`]", "", text).strip()
+        if not text:
+            continue
+        lower = text.lower()
+        if any(re.search(p, lower) for p in invalid_patterns):
+            continue
+        letters = re.findall(r"[a-zA-Z]", text)
+        if len(letters) < 4:
+            continue
+        if len(text.split()) > 20 or text.endswith((".", ";", ":")):
+            continue
+        if 5 <= len(text) <= 120:
+            detected_title = text
+            break
+
+    is_generic_fn = any(fallback.lower() == g for g in ("document", "paper", "book", "file", "download", "untitled"))
+    if detected_title and is_generic_fn:
+        return detected_title
+    if len(fallback) >= 6 and not is_generic_fn:
+        return fallback
+    return detected_title or fallback
 
 def get_safe_filename(title: str, max_len: int = 120) -> str:
-    s = re.sub(r'[:/\\?*"<>|]', " - ", title)
-    s = re.sub(r"\s+", " ", s).strip(" .-_")
-    if not s:
+    """Generate a clean, filesystem-safe and GitHub-safe filename from document title."""
+    s = re.sub(r"<!--.*?-->", "", title)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = re.sub(r'[:/\\?*"<>|!#`]', " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .-_#`!~")
+    if not s or len(re.findall(r"[a-zA-Z0-9]", s)) < 2:
         s = "Document"
     if len(s) > max_len:
         s = s[:max_len].rsplit(" ", 1)[0].strip()
     return s
+
+def push_github(repo, path: str, msg: str, content: str) -> None:
+    """Push new file or update existing file in GitHub repository with support for >1MB files."""
+    for attempt in range(3):
+        try:
+            sha = None
+            try:
+                item = repo.get_contents(path)
+                sha = item.sha if not isinstance(item, list) else None
+            except GithubException as ge:
+                if ge.status == 404:
+                    sha = None
+                elif ge.status == 403:
+                    parent = str(Path(path).parent).replace("\\", "/")
+                    fname = Path(path).name
+                    dir_path = "" if parent in (".", "") else parent
+                    dir_items = repo.get_contents(dir_path)
+                    if isinstance(dir_items, list):
+                        for it in dir_items:
+                            if it.name == fname:
+                                sha = it.sha
+                                break
+
+            if sha:
+                repo.update_file(path, msg, content, sha)
+            else:
+                try:
+                    repo.create_file(path, msg, content)
+                except GithubException as ce:
+                    parent = str(Path(path).parent).replace("\\", "/")
+                    fname = Path(path).name
+                    dir_path = "" if parent in (".", "") else parent
+                    dir_items = repo.get_contents(dir_path)
+                    if isinstance(dir_items, list):
+                        for it in dir_items:
+                            if it.name == fname:
+                                repo.update_file(path, msg, content, it.sha)
+                                return
+                    raise ce
+            return
+        except Exception as e:
+            if attempt == 2:
+                log.error("GitHub push failed permanently for %s: %s", path, e)
+                raise
+            time.sleep(2.0)
 
 def generate_master_readme(reg: dict[str, list[str]], repo_url: str) -> str:
     total = len(reg.get("papers", []))
@@ -363,7 +455,8 @@ def generate_master_readme(reg: dict[str, list[str]], repo_url: str) -> str:
         t = titles[i] if i < len(titles) else "Document"
         source = papers[i]
         safe_t = get_safe_filename(t)
-        rows.append(f"| `{pid}` | [{t}](text_vault/{safe_t}.md) | `{source}` | [JSONL Dataset](dataset_vault/{safe_t}_dataset.jsonl) |")
+        url_t = quote(safe_t)
+        rows.append(f"| `{pid}` | [{t}](text_vault/{url_t}.md) | `{source}` | [JSONL Dataset](dataset_vault/{url_t}_dataset.jsonl) |")
 
     table_content = "\n".join(rows) if rows else "| - | No documents registered yet | - | - |"
 
@@ -397,10 +490,10 @@ knowledge/
 {table_content}
 """
 
-def commit_vault(kb_id: str, title: str, clean_md: str, dataset: str, reg: dict[str, list[str]]) -> bool:
+def commit_vault(kb_id: str, title: str, clean_md: str, dataset: str, reg: dict[str, list[str]]) -> tuple[bool, str]:
     if not GITHUB_TOKEN or not GITHUB_REPO_URL:
         log.error("GitHub sync skipped: GITHUB_TOKEN or GITHUB_REPO_URL is missing.")
-        return False
+        return False, "Missing credentials"
     try:
         gh = Github(auth=Auth.Token(GITHUB_TOKEN))
         repo = gh.get_repo(extract_repo_name(GITHUB_REPO_URL))
@@ -411,10 +504,10 @@ def commit_vault(kb_id: str, title: str, clean_md: str, dataset: str, reg: dict[
         readme_content = generate_master_readme(reg, GITHUB_REPO_URL)
         push_github(repo, "README.md", f"docs: update catalog for {kb_id}", readme_content)
         log.info("Successfully pushed %s (%s) and README to GitHub Vault!", kb_id, safe_title)
-        return True
+        return True, "OK"
     except Exception as e:
-        log.error("GitHub commit failed for %s: %s", kb_id, e)
-        return False
+        log.exception("GitHub commit failed for %s: %s", kb_id, e)
+        return False, str(e)
 
 # ── Telethon Client & Topic Messaging ─────────────────────────────────────────
 client = TelegramClient(f"colab_bot_{TELEGRAM_BOT_TOKEN.split(':')[0]}", TELEGRAM_API_ID, TELEGRAM_API_HASH)
@@ -465,7 +558,7 @@ async def process_job(job: IngestionJob):
 
         # Step 2: Deduplication Check
         pdf_hash = compute_sha256(temp_pdf)
-        raw_title = Path(job.file_name).stem.replace("_", " ").replace("-", " ")
+        raw_title = clean_title_from_filename(job.file_name)
         is_dup, dup_id, dup_reason = check_deduplication(pdf_hash, raw_title, state.registry)
         if is_dup:
             if job.control_msg_id:
@@ -480,7 +573,7 @@ async def process_job(job: IngestionJob):
 
         loop = asyncio.get_running_loop()
         clean_md, pages = await loop.run_in_executor(None, extract_pdf, temp_pdf)
-        title = raw_title
+        title = extract_clean_title(clean_md, job.file_name)
         words = len(clean_md.split())
         chunks = chunk_text(clean_md, kb_id, title)
         dataset_content = "\n".join([json.dumps(c, ensure_ascii=False) for c in chunks]) + "\n"
@@ -504,15 +597,15 @@ async def process_job(job: IngestionJob):
         state.registry["hashes"].append(pdf_hash)
         state.registry["titles"].append(title)
         save_local_registry(state.registry)
-        gh_ok = await loop.run_in_executor(None, commit_vault, kb_id, title, clean_md, dataset_content, state.registry)
+        gh_ok, gh_err = await loop.run_in_executor(None, commit_vault, kb_id, title, clean_md, dataset_content, state.registry)
 
         # Mirror to Registry Topic 649 & General 1
-        await send_topic(REGISTRY_TOPIC_ID, f"📚 <b>[REGISTRY UPDATE — {kb_id}]</b>\n<b>Title:</b> {html.escape(title)}\n📊 Vault Total: <code>{len(state.registry['papers'])}</code>\n🔒 SHA256: <code>{pdf_hash}</code>\n🐙 GitHub: {'✅ Pushed to Vault' if gh_ok else '❌ Push Failed'}")
+        await send_topic(REGISTRY_TOPIC_ID, f"📚 <b>[REGISTRY UPDATE — {kb_id}]</b>\n<b>Title:</b> {html.escape(title)}\n📊 Vault Total: <code>{len(state.registry['papers'])}</code>\n🔒 SHA256: <code>{pdf_hash}</code>\n🐙 GitHub: {'✅ Pushed to Vault' if gh_ok else f'⚠️ Push Failed ({html.escape(gh_err[:40])})'}")
         await send_topic(GENERAL_TOPIC_ID, f"📢 <b>[VAULT INGESTION]</b>\n✅ Archived: <code>{kb_id}</code> — <i>{html.escape(title[:70])}</i>\n📚 Total Documents: <code>{len(state.registry['papers'])}</code>\n🐙 GitHub: {'✅ Synced' if gh_ok else 'Local only'}")
 
         # Completion Card in Topic 648
         dur = round(time.time() - start_t, 1)
-        final_msg = f"✅ <b>[INGESTION COMPLETE — {kb_id}]</b>\n\n📄 <b>{html.escape(title)}</b>\n⏱️ Time: {dur}s\n📊 {words:,} words | {pages} pages | {len(chunks)} chunks\n\n📦 <b>Delivered To:</b>\n  • 📄 PDF -> Topic #354\n  • 📝 TEXT -> Topic #355\n  • 📊 DATASET -> Topic #356\n  • 📚 REGISTRY -> Topic #649\n  • 🐙 GITHUB -> {'✅ Pushed to Vault' if gh_ok else '❌ Push Failed (Check Logs)'}"
+        final_msg = f"✅ <b>[INGESTION COMPLETE — {kb_id}]</b>\n\n📄 <b>{html.escape(title)}</b>\n⏱️ Time: {dur}s\n📊 {words:,} words | {pages} pages | {len(chunks)} chunks\n\n📦 <b>Delivered To:</b>\n  • 📄 PDF -> Topic #354\n  • 📝 TEXT -> Topic #355\n  • 📊 DATASET -> Topic #356\n  • 📚 REGISTRY -> Topic #649\n  • 🐙 GITHUB -> {'✅ Pushed to Vault' if gh_ok else f'❌ Push Failed ({html.escape(gh_err[:40])})'}"
         if job.control_msg_id:
             await client.edit_message(TELEGRAM_GROUP_ID, job.control_msg_id, final_msg, parse_mode="html")
     except Exception as e:
@@ -591,7 +684,7 @@ async def scan_channel_backlog():
                 state.processed_msg_ids.add(m.id)
                 fname = m.file.name
                 fsize = m.file.size or 0
-                raw_title = Path(fname).stem.replace("_", " ").replace("-", " ")
+                raw_title = clean_title_from_filename(fname)
 
                 # Deduplication pre-check against current registry
                 is_dup, dup_id, dup_reason = check_deduplication(None, raw_title, state.registry)
@@ -698,7 +791,7 @@ async def on_message(event):
     eta = estimate_eta(fsize, "deep")
 
     # Duplicate pre-check
-    raw_title = Path(fname).stem.replace("_", " ").replace("-", " ")
+    raw_title = clean_title_from_filename(fname)
     is_dup, dup_id, dup_reason = check_deduplication(None, raw_title, state.registry)
     if is_dup:
         log.info("Duplicate skipped: %s matches %s", fname, dup_id)
