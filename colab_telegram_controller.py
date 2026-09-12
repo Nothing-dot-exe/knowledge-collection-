@@ -90,6 +90,10 @@ TEXT_MD_TOPIC_ID = int(os.getenv("TEXT_MD_TOPIC_ID", "355"))
 DATASET_TOPIC_ID = int(os.getenv("DATASET_TOPIC_ID", "356"))
 GENERAL_TOPIC_ID = int(os.getenv("GENERAL_TOPIC_ID", "1"))
 
+# Default Monitored Channel (Read-Only Source)
+SOURCE_CHANNEL_USERNAME = os.getenv("SOURCE_CHANNEL", "mybooksaspdf").lstrip("@")
+SOURCE_CHANNEL_ID = -1003932114350
+
 # GitHub Credentials
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO_URL = os.getenv("GITHUB_REPO_URL", "https://github.com/Rawknowledge-database/knowledge")
@@ -982,88 +986,108 @@ async def message_handler(event):
     msg = event.message
     chat_id = event.chat_id
 
-    # Listen only to the target group or private chats with the bot
-    if chat_id != TELEGRAM_GROUP_ID and not event.is_private:
+    # Check if message is from the default monitored channel @mybooksaspdf
+    chat = await event.get_chat()
+    chat_username = (getattr(chat, "username", "") or "").lower()
+    is_source_channel = (
+        chat_username == SOURCE_CHANNEL_USERNAME.lower()
+        or chat_id == SOURCE_CHANNEL_ID
+        or str(chat_id).endswith("3932114350")
+    )
+    is_target_group = (chat_id == TELEGRAM_GROUP_ID)
+    is_dm = event.is_private
+
+    if not is_source_channel and not is_target_group and not is_dm:
         return
 
     topic_id = get_topic_id(msg)
 
-    # ── Command Handlers ──────────────────────────────────────────────────────
+    # ── Command Handlers (Topic 648 or DM) ────────────────────────────────────
     text = (msg.text or "").strip()
     cmd = text.split()[0].lower() if text.startswith("/") else ""
 
-    if cmd in ("/start", "/help"):
-        help_card = (
-            f"🎮 <b>[KNOWLEDGE BOT MISSION CONTROL]</b>\n\n"
-            f"Welcome! Send any PDF to this topic to convert and archive it.\n\n"
-            f"🕹️ <b>Available Commands:</b>\n"
-            f"• <code>/status</code> — Live GPU stats, disk usage, vault count\n"
-            f"• <code>/mode</code> — Toggle between Interactive & Auto-Ingest\n"
-            f"• <code>/pause</code> — Pause the sequential processing queue\n"
-            f"• <code>/resume</code> — Resume processing\n"
-            f"• <code>/sync</code> — Force sync with GitHub registry\n\n"
-            f"📊 <b>Topics:</b>\n"
-            f"• 🚀 <b>#648:</b> Upload & Control Center\n"
-            f"• 📚 <b>#649:</b> Registry Mirror\n"
-            f"• 📄 <b>#354:</b> PDF Vault\n"
-            f"• 📝 <b>#355:</b> Clean Text\n"
-            f"• 📊 <b>#356:</b> SFT Datasets\n"
-            f"• 📢 <b>#1:</b> General Updates"
-        )
-        await event.reply(help_card, parse_mode="html")
-        return
+    if is_target_group or is_dm:
+        if cmd in ("/start", "/help"):
+            help_card = (
+                f"🎮 <b>[KNOWLEDGE BOT MISSION CONTROL]</b>\n\n"
+                f"• Monitored Channel: <b>@{SOURCE_CHANNEL_USERNAME}</b> (Read-Only 1-by-1 Ingestion)\n"
+                f"• Drop any PDF directly in Topic #648 to convert manually!\n\n"
+                f"🕹️ <b>Available Commands:</b>\n"
+                f"• <code>/status</code> — Live GPU stats, queue status, vault count\n"
+                f"• <code>/mode</code> — Toggle between Interactive & Auto-Ingest\n"
+                f"• <code>/pause</code> — Pause the sequential processing queue\n"
+                f"• <code>/resume</code> — Resume processing\n"
+                f"• <code>/sync</code> — Force sync with GitHub registry\n"
+                f"• <code>/scan</code> — Verify connection to @{SOURCE_CHANNEL_USERNAME}\n\n"
+                f"📊 <b>Topics:</b>\n"
+                f"• 🚀 <b>#648:</b> Upload & Control Center\n"
+                f"• 📚 <b>#649:</b> Registry Mirror\n"
+                f"• 📄 <b>#354:</b> PDF Vault\n"
+                f"• 📝 <b>#355:</b> Clean Text\n"
+                f"• 📊 <b>#356:</b> SFT Datasets\n"
+                f"• 📢 <b>#1:</b> General Updates"
+            )
+            await event.reply(help_card, parse_mode="html")
+            return
 
-    elif cmd == "/status":
-        uptime_mins = int((time.time() - state.start_time) / 60)
-        q_size = state.queue.qsize()
-        active_name = state.active_job.file_name if state.active_job else "None (Idle)"
+        elif cmd == "/status":
+            uptime_mins = int((time.time() - state.start_time) / 60)
+            q_size = state.queue.qsize()
+            active_name = state.active_job.file_name if state.active_job else "None (Idle)"
+            disk_free_gb = shutil.disk_usage(BASE_DIR).free / (1024**3)
 
-        disk_free_gb = shutil.disk_usage(BASE_DIR).free / (1024**3)
+            status_card = (
+                f"📊 <b>[SYSTEM STATUS & HEALTH]</b>\n\n"
+                f"📡 <b>Monitored Channel:</b> <code>@{SOURCE_CHANNEL_USERNAME}</code> (Read-Only)\n"
+                f"📚 <b>Registered Documents:</b> <code>{len(state.registry['papers'])}</code>\n"
+                f"🆔 <b>Next Sequential ID:</b> <code>KB-{state.highest_kb_num + 1:04d}</code>\n"
+                f"⚡ <b>Queue Status:</b> {'⏸️ Paused' if state.is_paused else '🟢 Running'}\n"
+                f"📥 <b>In Queue:</b> {q_size} documents\n"
+                f"⚙️ <b>Active Ingestion:</b> <code>{html.escape(active_name)}</code>\n"
+                f"🎛️ <b>Ingest Mode:</b> <code>{state.current_mode.upper()}</code>\n"
+                f"💾 <b>Free Disk:</b> {disk_free_gb:.1f} GB\n"
+                f"⏱️ <b>Bot Uptime:</b> {uptime_mins} minutes"
+            )
+            await event.reply(status_card, parse_mode="html")
+            return
 
-        status_card = (
-            f"📊 <b>[SYSTEM STATUS & HEALTH]</b>\n\n"
-            f"📚 <b>Registered Documents:</b> <code>{len(state.registry['papers'])}</code>\n"
-            f"🆔 <b>Next Sequential ID:</b> <code>KB-{state.highest_kb_num + 1:04d}</code>\n"
-            f"⚡ <b>Queue Status:</b> {'⏸️ Paused' if state.is_paused else '🟢 Running'}\n"
-            f"📥 <b>In Queue:</b> {q_size} documents\n"
-            f"⚙️ <b>Active Ingestion:</b> <code>{html.escape(active_name)}</code>\n"
-            f"🎛️ <b>Ingest Mode:</b> <code>{state.current_mode.upper()}</code>\n"
-            f"💾 <b>Free Disk:</b> {disk_free_gb:.1f} GB\n"
-            f"⏱️ <b>Bot Uptime:</b> {uptime_mins} minutes"
-        )
-        await event.reply(status_card, parse_mode="html")
-        return
+        elif cmd == "/pause":
+            state.is_paused = True
+            await event.reply("⏸️ <b>Ingestion Queue Paused.</b> Current document will finish, then queue will halt.", parse_mode="html")
+            return
 
-    elif cmd == "/pause":
-        state.is_paused = True
-        await event.reply("⏸️ <b>Ingestion Queue Paused.</b> Current document will finish, then queue will halt.", parse_mode="html")
-        return
+        elif cmd == "/resume":
+            state.is_paused = False
+            await event.reply("▶️ <b>Ingestion Queue Resumed!</b>", parse_mode="html")
+            return
 
-    elif cmd == "/resume":
-        state.is_paused = False
-        await event.reply("▶️ <b>Ingestion Queue Resumed!</b>", parse_mode="html")
-        return
+        elif cmd == "/mode":
+            state.current_mode = "auto" if state.current_mode == "interactive" else "interactive"
+            await event.reply(f"🎛️ <b>Mode Switched:</b> Ingest mode is now set to <b>{state.current_mode.upper()}</b>.", parse_mode="html")
+            return
 
-    elif cmd == "/mode":
-        state.current_mode = "auto" if state.current_mode == "interactive" else "interactive"
-        await event.reply(f"🎛️ <b>Mode Switched:</b> Ingest mode is now set to <b>{state.current_mode.upper()}</b>.", parse_mode="html")
-        return
+        elif cmd == "/sync":
+            await event.reply("🔄 <b>Syncing Registry with GitHub...</b>", parse_mode="html")
+            state.registry, state.highest_kb_num = sync_github_registry(GITHUB_TOKEN, GITHUB_REPO_URL, state.registry)
+            reg_sync_card = (
+                f"📚 <b>[REGISTRY SYNC COMPLETE]</b>\n"
+                f"Total papers: <code>{len(state.registry['papers'])}</code>\n"
+                f"Highest Vault ID: <code>KB-{state.highest_kb_num:04d}</code>"
+            )
+            await send_to_topic(REGISTRY_TOPIC_ID, reg_sync_card)
+            await event.reply("✅ <b>Registry synced and posted to Topic #649!</b>", parse_mode="html")
+            return
 
-    elif cmd == "/sync":
-        await event.reply("🔄 <b>Syncing Registry with GitHub...</b>", parse_mode="html")
-        state.registry, state.highest_kb_num = sync_github_registry(GITHUB_TOKEN, GITHUB_REPO_URL, state.registry)
-        reg_sync_card = (
-            f"📚 <b>[REGISTRY SYNC COMPLETE]</b>\n"
-            f"Total papers: <code>{len(state.registry['papers'])}</code>\n"
-            f"Highest Vault ID: <code>KB-{state.highest_kb_num:04d}</code>"
-        )
-        await send_to_topic(REGISTRY_TOPIC_ID, reg_sync_card)
-        await event.reply("✅ <b>Registry synced and posted to Topic #649!</b>", parse_mode="html")
-        return
+        elif cmd == "/scan":
+            try:
+                chan_ent = await client.get_entity(SOURCE_CHANNEL_USERNAME)
+                await event.reply(f"🟢 <b>Monitored Channel Active:</b> <code>@{SOURCE_CHANNEL_USERNAME}</code> (ID: <code>{chan_ent.id}</code>).\nAny new PDF will be picked up 1-by-1 without modifying the channel!", parse_mode="html")
+            except Exception as e:
+                await event.reply(f"⚠️ Channel access note: {e}", parse_mode="html")
+            return
 
-    # ── PDF Document Ingestion in Topic 648 (or private chat) ────────────────
-    # Check if this is an uploaded document in Topic 648 (or DM)
-    if not event.is_private and topic_id != UPLOAD_TOPIC_ID:
+    # ── PDF Document Detection (From @mybooksaspdf OR Topic 648 OR DM) ────────
+    if is_target_group and topic_id != UPLOAD_TOPIC_ID:
         return
 
     doc = msg.document
@@ -1092,21 +1116,23 @@ async def message_handler(event):
     raw_title = Path(file_name).stem.replace("_", " ").replace("-", " ")
     is_dup, dup_id, dup_reason = check_deduplication(None, raw_title, state.registry)
     if is_dup:
-        dup_alert = (
-            f"⚠️ <b>[DUPLICATE DETECTED — SKIPPED]</b>\n\n"
-            f"📄 <b>File:</b> <code>{html.escape(file_name)}</code>\n"
-            f"🛡️ <b>Matched Entry:</b> <code>{dup_id}</code>\n"
-            f"🔍 <b>Reason:</b> {html.escape(dup_reason)}\n\n"
-            f"<i>This document already exists in the registry. Skipping to prevent duplicates.</i>"
-        )
-        await msg.reply(dup_alert, parse_mode="html")
+        log.info("Document '%s' already in registry (%s: %s). Skipping.", file_name, dup_id, dup_reason)
+        if not is_source_channel:
+            dup_alert = (
+                f"⚠️ <b>[DUPLICATE DETECTED — SKIPPED]</b>\n\n"
+                f"📄 <b>File:</b> <code>{html.escape(file_name)}</code>\n"
+                f"🛡️ <b>Matched Entry:</b> <code>{dup_id}</code>\n"
+                f"🔍 <b>Reason:</b> {html.escape(dup_reason)}\n\n"
+                f"<i>This document already exists in the registry. Skipping to prevent duplicates.</i>"
+            )
+            await msg.reply(dup_alert, parse_mode="html")
         return
 
-    # Create Ingestion Job
+    # Create Ingestion Job (STRICTLY READ-ONLY from source channel: NEVER delete from channel)
     job = IngestionJob(
         job_id=job_id,
         message_id=msg.id,
-        topic_id=topic_id or UPLOAD_TOPIC_ID,
+        topic_id=UPLOAD_TOPIC_ID,
         chat_id=chat_id,
         file_name=file_name,
         file_size_bytes=file_size,
@@ -1115,8 +1141,24 @@ async def message_handler(event):
         eta_seconds=eta,
     )
 
+    if is_source_channel:
+        # Channel documents are queued automatically for 1-by-1 processing
+        chan_notice = (
+            f"📡 <b>[NEW BOOK IN @{SOURCE_CHANNEL_USERNAME}]</b>\n\n"
+            f"📄 <b>File:</b> <code>{html.escape(file_name)}</code>\n"
+            f"📊 <b>Size:</b> {size_mb:.2f} MB | ⏱️ <b>ETA:</b> ~{eta}s\n"
+            f"⏳ <b>Queue Position:</b> {state.queue.qsize() + 1}\n\n"
+            f"<i>Original PDF remains safe & untouched in @{SOURCE_CHANNEL_USERNAME}.</i>"
+        )
+        abort_btn = [[Button.inline("⏹️ Abort / Stop Processing", data=f"abort_{job.job_id}".encode())]]
+        ctrl_msg = await send_to_topic(UPLOAD_TOPIC_ID, chan_notice, buttons=abort_btn)
+        if ctrl_msg:
+            job.control_msg_id = ctrl_msg.id
+        await state.queue.put(job)
+        return
+
     if state.current_mode == "auto":
-        # Auto-ingest immediately
+        # Auto-ingest immediately for direct uploads
         ctrl_card = (
             f"📄 <b>[DOCUMENT RECEIVED — AUTO INGEST]</b>\n\n"
             f"<b>File:</b> <code>{html.escape(file_name)}</code>\n"

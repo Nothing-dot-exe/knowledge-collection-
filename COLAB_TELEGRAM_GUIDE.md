@@ -17,6 +17,21 @@ The script will automatically install all dependencies (`telethon`, `docling`, `
 
 ---
 
+## 📡 Default Monitored Channel: [@mybooksaspdf](https://t.me/mybooksaspdf)
+
+The bot continuously checks and listens to **@mybooksaspdf** for new incoming books and PDFs:
+* **Strictly Read-Only**: The bot **NEVER deletes** any message or PDF from `@mybooksaspdf`. The source channel remains 100% untouched.
+* **Strictly 1-by-1**: Each book is queued sequentially so Colab GPU memory and disk usage never overflow.
+* **Dual Delivery**:
+  - **Telegram**: Sends original PDF (`#354`), clean Markdown (`#355`), JSONL dataset (`#356`), and registry card (`#649`).
+  - **GitHub Vault**: Commits `text_vault/`, `dataset_vault/`, `registry.json`, and `README.md` to [`Rawknowledge-database/knowledge`](https://github.com/Rawknowledge-database/knowledge).
+* **Actual Book Names Everywhere**: All files are named after the actual book/document title (e.g. `Think Before You Link.md` and `Think Before You Link_dataset.jsonl`).
+
+> [!TIP]
+> **Admin Requirement for Channel Listening**: Make sure `@Automatedpush_bot` is added as an **Administrator** in `@mybooksaspdf` (with standard read/view permissions) so Telegram forwards new channel posts to the bot.
+
+---
+
 ## 🎮 Telegram Mission Control (Topic #648)
 
 You can send any PDF (up to **2 GB**) directly into **Topic #648** (`Upload data`).

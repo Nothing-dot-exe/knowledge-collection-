@@ -94,6 +94,9 @@ TEXT_MD_TOPIC_ID = int(os.getenv("TEXT_MD_TOPIC_ID", "355"))
 DATASET_TOPIC_ID = int(os.getenv("DATASET_TOPIC_ID", "356"))
 GENERAL_TOPIC_ID = int(os.getenv("GENERAL_TOPIC_ID", "1"))
 
+SOURCE_CHANNEL_USERNAME = os.getenv("SOURCE_CHANNEL", "mybooksaspdf").lstrip("@")
+SOURCE_CHANNEL_ID = -1003932114350
+
 try:
     from google.colab import userdata
     GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or userdata.get("GITHUB_TOKEN") or ""
@@ -444,29 +447,46 @@ async def worker_loop():
 @client.on(events.NewMessage)
 async def on_message(event):
     msg = event.message
-    if event.chat_id != TELEGRAM_GROUP_ID and not event.is_private:
+    chat_id = event.chat_id
+    chat = await event.get_chat()
+    chat_username = (getattr(chat, "username", "") or "").lower()
+    is_source_channel = (
+        chat_username == SOURCE_CHANNEL_USERNAME.lower()
+        or chat_id == SOURCE_CHANNEL_ID
+        or str(chat_id).endswith("3932114350")
+    )
+    is_target_group = (chat_id == TELEGRAM_GROUP_ID)
+    is_dm = event.is_private
+
+    if not is_source_channel and not is_target_group and not is_dm:
         return
+
     t_id = get_topic(msg)
     txt = (msg.text or "").strip()
 
-    if txt.startswith("/status"):
-        await event.reply(f"📊 <b>[STATUS]</b>\n📚 Registered: <code>{len(state.registry['papers'])}</code>\n🆔 Next ID: <code>KB-{state.highest_kb_num + 1:04d}</code>\n⚡ Queue: {'⏸️ Paused' if state.is_paused else '🟢 Active'} ({state.queue.qsize()} waiting)\n🎛️ Mode: <code>{state.current_mode.upper()}</code>", parse_mode="html")
-        return
-    elif txt.startswith("/pause"):
-        state.is_paused = True
-        await event.reply("⏸️ Queue paused.", parse_mode="html")
-        return
-    elif txt.startswith("/resume"):
-        state.is_paused = False
-        await event.reply("▶️ Queue resumed.", parse_mode="html")
-        return
-    elif txt.startswith("/mode"):
-        state.current_mode = "auto" if state.current_mode == "interactive" else "interactive"
-        await event.reply(f"🎛️ Mode switched to <b>{state.current_mode.upper()}</b>", parse_mode="html")
-        return
+    if is_target_group or is_dm:
+        if txt.startswith("/status"):
+            await event.reply(f"📊 <b>[STATUS]</b>\n📡 Channel: <code>@{SOURCE_CHANNEL_USERNAME}</code> (Read-Only)\n📚 Registered: <code>{len(state.registry['papers'])}</code>\n🆔 Next ID: <code>KB-{state.highest_kb_num + 1:04d}</code>\n⚡ Queue: {'⏸️ Paused' if state.is_paused else '🟢 Active'} ({state.queue.qsize()} waiting)\n🎛️ Mode: <code>{state.current_mode.upper()}</code>", parse_mode="html")
+            return
+        elif txt.startswith("/pause"):
+            state.is_paused = True
+            await event.reply("⏸️ Queue paused.", parse_mode="html")
+            return
+        elif txt.startswith("/resume"):
+            state.is_paused = False
+            await event.reply("▶️ Queue resumed.", parse_mode="html")
+            return
+        elif txt.startswith("/mode"):
+            state.current_mode = "auto" if state.current_mode == "interactive" else "interactive"
+            await event.reply(f"🎛️ Mode switched to <b>{state.current_mode.upper()}</b>", parse_mode="html")
+            return
+        elif txt.startswith("/sync"):
+            state.registry, state.highest_kb_num = sync_github_registry(GITHUB_TOKEN, GITHUB_REPO_URL, state.registry)
+            await event.reply(f"✅ Registry synced ({len(state.registry['papers'])} total)!", parse_mode="html")
+            return
 
-    # PDF Upload in Topic 648
-    if not event.is_private and t_id != UPLOAD_TOPIC_ID:
+    # PDF Ingestion from @mybooksaspdf or Topic 648
+    if is_target_group and t_id != UPLOAD_TOPIC_ID:
         return
     doc = msg.document
     if not doc:
@@ -489,10 +509,27 @@ async def on_message(event):
     raw_title = Path(fname).stem.replace("_", " ").replace("-", " ")
     is_dup, dup_id, dup_reason = check_deduplication(None, raw_title, state.registry)
     if is_dup:
-        await msg.reply(f"⚠️ <b>[DUPLICATE DETECTED]</b>\n<code>{html.escape(fname)}</code> matches <code>{dup_id}</code>.\nSkipped to prevent duplicate storage.", parse_mode="html")
+        log.info("Duplicate skipped: %s matches %s", fname, dup_id)
+        if not is_source_channel:
+            await msg.reply(f"⚠️ <b>[DUPLICATE DETECTED]</b>\n<code>{html.escape(fname)}</code> matches <code>{dup_id}</code>.\nSkipped to prevent duplicate storage.", parse_mode="html")
         return
 
-    job = IngestionJob(job_id=job_id, message_id=msg.id, topic_id=t_id or UPLOAD_TOPIC_ID, chat_id=event.chat_id, file_name=fname, file_size_bytes=fsize, media_obj=msg.media, eta_seconds=eta)
+    # Job created (STRICTLY READ-ONLY from channel: NEVER deletes from channel)
+    job = IngestionJob(job_id=job_id, message_id=msg.id, topic_id=UPLOAD_TOPIC_ID, chat_id=event.chat_id, file_name=fname, file_size_bytes=fsize, media_obj=msg.media, eta_seconds=eta)
+
+    if is_source_channel:
+        chan_card = (
+            f"📡 <b>[NEW BOOK IN @{SOURCE_CHANNEL_USERNAME}]</b>\n\n"
+            f"📄 <b>File:</b> <code>{html.escape(fname)}</code>\n"
+            f"📊 <b>Size:</b> {fsize/(1024*1024):.2f} MB | ⏱️ <b>ETA:</b> ~{eta}s\n"
+            f"⏳ <b>Queue Position:</b> {state.queue.qsize() + 1}\n\n"
+            f"<i>Original PDF remains safe & untouched in channel.</i>"
+        )
+        ctrl = await send_topic(UPLOAD_TOPIC_ID, chan_card, buttons=[[Button.inline("⏹️ Abort", data=f"abort_{job_id}".encode())]])
+        if ctrl:
+            job.control_msg_id = ctrl.id
+        await state.queue.put(job)
+        return
 
     if state.current_mode == "auto":
         ctrl = await msg.reply(f"📄 <b>[QUEUED — AUTO INGEST]</b>\n<b>File:</b> <code>{html.escape(fname)}</code> ({fsize/(1024*1024):.2f} MB)\n⏱️ ETA: ~{eta}s", buttons=[[Button.inline("⏹️ Abort", data=f"abort_{job_id}".encode())]], parse_mode="html")
