@@ -1155,7 +1155,9 @@ async def scan_channel_backlog():
             log.error("Could not resolve channel @%s: %s", SOURCE_CHANNEL_USERNAME, e)
             return
 
-    last_scanned_id = 0
+    curr_id = 1
+    batch_size = 20
+    empty_streak = 0
 
     while True:
         try:
@@ -1163,16 +1165,31 @@ async def scan_channel_backlog():
             while state.is_paused or state.active_job is not None or not state.queue.empty():
                 await asyncio.sleep(2.0)
 
-            found_any = False
-            # Iterate messages strictly in chronological order (oldest to newest)
-            async for m in client.iter_messages(channel, reverse=True, min_id=last_scanned_id):
-                if m.id > last_scanned_id:
-                    last_scanned_id = m.id
+            # Bot-safe retrieval: uses channels.GetMessagesRequest(id=[...]) which bots are permitted to use
+            ids = list(range(curr_id, curr_id + batch_size))
+            msgs = await client.get_messages(channel, ids=ids)
+            valid = [m for m in msgs if m]
 
-                if not m.file or not m.file.name or not m.file.name.lower().endswith(".pdf"):
+            if not valid:
+                empty_streak += 1
+                if empty_streak >= 3:
+                    # Reached the current end of the channel: wait 15 seconds and check again
+                    await asyncio.sleep(15.0)
+                    empty_streak = 0
+                    continue
+                else:
+                    curr_id += batch_size
+                    await asyncio.sleep(0.5)
                     continue
 
+            empty_streak = 0
+            for m in valid:
+                curr_id = max(curr_id, m.id + 1)
+
                 if m.id in state.processed_msg_ids:
+                    continue
+
+                if not m.file or not m.file.name or not m.file.name.lower().endswith(".pdf"):
                     continue
 
                 fname = m.file.name
@@ -1215,7 +1232,6 @@ async def scan_channel_backlog():
                 # Enqueue THIS SINGLE JOB
                 await state.queue.put(job)
                 log.info("Enqueued channel PDF #%d: %s. Scanner pausing until this job completes and dispatches.", m.id, fname)
-                found_any = True
 
                 # WAIT UNTIL THIS JOB IS 100% COMPLETE & DISPATCHED BEFORE CONTINUING TO NEXT!
                 while state.active_job is not None or not state.queue.empty():
@@ -1223,11 +1239,9 @@ async def scan_channel_backlog():
 
                 # Brief pause between documents
                 await asyncio.sleep(1.0)
+                break
 
-            # When all current backlog messages in the channel are processed:
-            # Wait 15 seconds, then loop again with min_id=last_scanned_id to check for any new PDFs!
-            if not found_any:
-                await asyncio.sleep(15.0)
+            await asyncio.sleep(0.5)
 
         except asyncio.CancelledError:
             log.info("Channel backlog scanner cancelled gracefully.")
