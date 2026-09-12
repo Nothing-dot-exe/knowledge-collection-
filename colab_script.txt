@@ -1,1257 +1,540 @@
 # ==============================================================================
-# 🧠 Knowledge Agent v3 — 24/7 Omni-Source & Full-Coverage Fine-Tuning Engine
+# 🧠 Colab Telegram Agent — Interactive 1-by-1 Ingestion & User Control Center
 # ==============================================================================
 # HOW TO RUN IN GOOGLE COLAB:
 # 1. Open https://colab.research.google.com and create a New Notebook.
-# 2. Set GPU runtime: Runtime -> Change runtime type -> T4 GPU (recommended).
+# 2. Set GPU runtime: Runtime -> Change runtime type -> T4 GPU (free or pro).
 # 3. Copy everything from this file and paste it into a code cell.
 # 4. Press Shift + Enter to run!
 #
-# • ZERO LINKS: 100% sanitized markdown files with zero URL pollution.
-# • 100% FULL COVERAGE: Chunks documents into 2K-token JSONL chunks (0% GPU truncation).
-# • TOPIC ROUTING:
-#     - 📄 PDFs     -> Topic 354 (https://t.me/c/3958148223/354)
-#     - 📝 Text     -> Topic 355 (https://t.me/c/3958148223/355)
-#     - 📊 Datasets -> Topic 356 (https://t.me/c/3958148223/356)
-#     - 🚨 General  -> Topic 1   (https://t.me/c/3958148223/1)
-# • GITHUB DUAL-VAULT: text_vault/ + dataset_vault/ + Master README.md
-# • 24/7 CRASH-PROOF: Automatic error recovery with instant alerts to Topic 1.
+# • MTPROTO ENGINE: Telethon client directly bypasses Telegram's 20MB limit up to 2GB!
+# • FULL USER CONTROL: Send PDFs to Topic #648 to start, stop, or configure with ETA.
+# • STRICT REGISTRY DEDUPLICATION: Checks against 21+ existing papers before processing.
+# • TOPIC DISPATCH:
+#     - 🚀 Topic #648 : User Control Center (Start/Abort buttons, live % progress & ETA)
+#     - 📚 Topic #649 : Registry Mirror (auto-updates catalog & SHA-256 hashes)
+#     - 📄 Topic #354 : PDF Vault (original documents archived)
+#     - 📝 Topic #355 : TEXT (zero-link clean Markdown .md)
+#     - 📊 Topic #356 : DATA SET (Unsloth/LLaMA-Factory fine-tuning JSONL)
+#     - 📢 Topic #1   : General (milestones & ingestion summaries)
+# • ZERO DISK OVERFLOW: Deletes raw PDF from disk immediately after processing.
 # ==============================================================================
 
-"""
-🧠 Knowledge Agent v3 — 24/7 Omni-Source RAG & Full-Coverage Fine-Tuning Engine
-================================================================================
-Features:
-• Zero-Link Sanitization : 100% clean markdown text files with zero URL pollution.
-• 100% Full-Coverage Chunker: Splits documents into semantic 2K-token chunks (0% truncated on GPU).
-• Multi-Topic Telegram Dispatch:
-    - 📄 PDFs       -> Topic 354 (https://t.me/c/3958148223/354)
-    - 📝 Text       -> Topic 355 (https://t.me/c/3958148223/355)
-    - 📊 Datasets   -> Topic 356 (https://t.me/c/3958148223/356)
-    - 🚨 General    -> Topic 1   (https://t.me/c/3958148223/1)
-• GitHub Dual-Vault Storage:
-    - text_vault/       <- Clean full-text markdown (Zero Links)
-    - dataset_vault/    <- Full-coverage chunked JSONL for LLM training
-    - README.md         <- Master catalog & documentation
-• 4-Layer Deduplication : L1 (arXiv ID) + L2 (Title) + L3 (Fuzzy) + L4 (SHA-256)
-• 24/7 Crash-Proof      : Continuous daemon loop with automatic alert dispatch to Topic 1
-"""
+import subprocess
+import sys
 
-from __future__ import annotations
+# ── Auto-install required packages on Google Colab ─────────────────────────────
+REQUIRED_PACKAGES = [
+    ("telethon", "telethon>=1.36.0"),
+    ("docling", "docling>=2.0.0"),
+    ("github", "PyGithub>=2.1.0"),
+    ("thefuzz", "thefuzz>=0.22.0"),
+    ("requests", "requests>=2.28.0"),
+    ("dotenv", "python-dotenv>=1.0.0"),
+]
 
+for _mod, _pkg in REQUIRED_PACKAGES:
+    try:
+        __import__(_mod)
+    except ImportError:
+        print(f"📦 Installing required package '{_pkg}'...", flush=True)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", _pkg])
+
+import asyncio
 import hashlib
 import html
 import json
 import logging
 import os
 import re
-import subprocess
-import sys
+import shutil
 import time
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-# Ensure UTF-8 output on Windows terminal
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+from github import Auth, Github, GithubException
+from telethon import Button, TelegramClient, events
+from telethon.tl.types import MessageReplyHeader
 
-# ── Auto-install missing packages in Google Colab / Fresh environments ─────────
-for _mod, _pkg in [
-    ("docling", "docling"),
-    ("github", "PyGithub"),
-    ("thefuzz", "thefuzz"),
-    ("requests", "requests"),
-]:
-    try:
-        __import__(_mod)
-    except ImportError:
-        print(f"📦 Auto-installing missing package '{_pkg}'...", flush=True)
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", _pkg])
-
-import requests
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from github import Github, GithubException, Auth
-from thefuzz import fuzz
-
-# ── Paths & Colab / Jupyter Safe Root ──────────────────────────────────────────
 try:
-    ROOT = Path(__file__).parent
-except NameError:
-    ROOT = Path.cwd()
+    from thefuzz import fuzz
+except ImportError:
+    class _Fuzz:
+        @staticmethod
+        def ratio(a: str, b: str) -> int:
+            return 100 if a.lower() == b.lower() else 0
+    fuzz = _Fuzz()
 
-TEXT_VAULT_DIR = ROOT / "text_vault"
-DATASET_VAULT_DIR = ROOT / "dataset_vault"
-PDF_DIR = ROOT / "raw_pdfs"
-REGISTRY = ROOT / "registry.json"
-LOG_DIR = ROOT / "logs"
-GLOBAL_DATASET_FILE = DATASET_VAULT_DIR / "dataset.jsonl"
-
-TEXT_VAULT_DIR.mkdir(exist_ok=True)
-DATASET_VAULT_DIR.mkdir(exist_ok=True)
-PDF_DIR.mkdir(exist_ok=True)
-LOG_DIR.mkdir(exist_ok=True)
-
-# ── Logging Setup ──────────────────────────────────────────────────────────────
-log_file = LOG_DIR / f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
+# Setup Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(log_file, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
-    force=True,
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("ColabController")
 
-for noisy in ["MatchingPostProcessor", "docling", "docling.pipeline", "urllib3", "github"]:
-    logging.getLogger(noisy).setLevel(logging.ERROR)
+# Colab Paths
+BASE_DIR = Path.cwd()
+TEMP_DIR = BASE_DIR / "temp_colab"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_REGISTRY_FILE = BASE_DIR / "registry.json"
 
+# Credentials & Topic IDs
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8525850416:AAGtYIM1sg8MF21_8lI2hOS1E-i9MosV4RE")
+TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "32962732"))
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "2b6abfa8621f5a53b2d0a3a79d3bf739")
+TELEGRAM_GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1003958148223"))
 
-def status(msg: str, *args) -> None:
-    """Print directly to terminal/Colab with flush=True so logs are never hidden."""
-    if args:
-        try:
-            formatted = msg % args
-        except Exception:
-            formatted = f"{msg} " + " ".join(str(a) for a in args)
-    else:
-        formatted = msg
-    print(formatted, flush=True)
-    log.info(formatted)
+UPLOAD_TOPIC_ID = int(os.getenv("UPLOAD_TOPIC_ID", "648"))
+REGISTRY_TOPIC_ID = int(os.getenv("REGISTRY_TOPIC_ID", "649"))
+RAW_PDF_TOPIC_ID = int(os.getenv("RAW_PDF_TOPIC_ID", "354"))
+TEXT_MD_TOPIC_ID = int(os.getenv("TEXT_MD_TOPIC_ID", "355"))
+DATASET_TOPIC_ID = int(os.getenv("DATASET_TOPIC_ID", "356"))
+GENERAL_TOPIC_ID = int(os.getenv("GENERAL_TOPIC_ID", "1"))
 
+try:
+    from google.colab import userdata
+    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or userdata.get("GITHUB_TOKEN") or ""
+except Exception:
+    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO_URL = os.getenv("GITHUB_REPO_URL", "https://github.com/Rawknowledge-database/knowledge")
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  DATA MODEL
-# ══════════════════════════════════════════════════════════════════════════════
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
+DEFAULT_PAIRS_COUNT = int(os.getenv("DATASET_PAIRS_PER_PAPER", "5"))
 
+# ── State Management ──────────────────────────────────────────────────────────
 @dataclass
-class PaperInfo:
-    """Unified metadata container. Works with RSS, HF API, and direct lookups."""
-    arxiv_id: str
-    title: str
-    abstract: str = ""
-    authors: str = ""
-    categories: str = ""
-    published: str = ""
-    pdf_url: str = ""
-    entry_url: str = ""
-    code_repo: str | None = None
-    stars: int | None = None
-    upvotes: int | None = None
-    track: str = ""
+class IngestionJob:
+    job_id: str
+    message_id: int
+    topic_id: int
+    chat_id: int
+    file_name: str
+    file_size_bytes: int
+    media_obj: Any
+    mode: str = "deep"
+    eta_seconds: int = 25
+    created_at: float = field(default_factory=time.time)
+    control_msg_id: int | None = None
+    cancelled: bool = False
 
-    def __post_init__(self):
-        base = strip_arxiv_version(self.arxiv_id)
-        if not self.pdf_url:
-            self.pdf_url = f"https://arxiv.org/pdf/{base}.pdf"
-        if not self.entry_url:
-            self.entry_url = f"https://arxiv.org/abs/{base}"
+class AgentState:
+    def __init__(self):
+        self.queue: asyncio.Queue[IngestionJob] = asyncio.Queue()
+        self.pending_interactive: dict[str, IngestionJob] = {}
+        self.active_job: IngestionJob | None = None
+        self.is_paused: bool = False
+        self.current_mode: str = "interactive"
+        self.registry: dict[str, list[str]] = {"papers": [], "hashes": [], "titles": []}
+        self.highest_kb_num: int = 0
+        self.start_time: float = time.time()
 
+state = AgentState()
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TRACK CURRICULUM
-# ══════════════════════════════════════════════════════════════════════════════
-
-TECH_CURRICULUM_RSS = [
-    ("🛡 Cybersecurity & Exploits",           ["cs.CR"]),
-    ("🤖 AI & Language Models (LLMs)",        ["cs.AI", "cs.CL"]),
-    ("🧠 Machine Learning & Deep Learning",   ["cs.LG", "stat.ML"]),
-    ("👁 Computer Vision & Multimodal",        ["cs.CV"]),
-    ("💻 Advanced Coding & Algorithms",       ["cs.DS", "cs.PL"]),
-    ("🛠 Software Eng & Git Architecture",     ["cs.SE"]),
-    ("🐧 Linux & Operating Systems",           ["cs.OS"]),
-    ("☁ Cloud, Servers & Distributed Sys",    ["cs.DC"]),
-    ("🌐 Networks, Web & Protocols",          ["cs.NI", "cs.IR"]),
-    ("📐 Computational Mathematics",           ["math.NA", "math.OC", "cs.CC"]),
-]
-
-PAPERS_PER_CATEGORY = int(os.environ.get("PAPERS_PER_CATEGORY", "15"))
-FUZZY_THRESHOLD = 88
-MIN_MD_CHARS = 400
-
-TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  REGISTRY  —  Load / Save / Remote Sync
-# ══════════════════════════════════════════════════════════════════════════════
-
-def load_registry() -> dict:
-    if REGISTRY.exists():
+# ── Registry & Deduplication ──────────────────────────────────────────────────
+def load_local_registry() -> dict[str, list[str]]:
+    if LOCAL_REGISTRY_FILE.exists():
         try:
-            return json.loads(REGISTRY.read_text(encoding="utf-8"))
+            return json.loads(LOCAL_REGISTRY_FILE.read_text(encoding="utf-8"))
         except Exception:
-            return {"papers": [], "hashes": [], "titles": []}
+            pass
     return {"papers": [], "hashes": [], "titles": []}
 
-
-def save_registry(reg: dict) -> None:
-    REGISTRY.write_text(json.dumps(reg, indent=2), encoding="utf-8")
-
-
-def sync_remote_registry(gh_token: str, repo_url: str, local_reg: dict) -> dict:
-    """Pull the latest remote registry from GitHub so documents are NEVER re-downloaded even across machines."""
+def save_local_registry(reg: dict[str, list[str]]) -> None:
     try:
-        repo_name = re.sub(r"https?://github\.com/", "", repo_url).rstrip("/").removesuffix(".git")
-        g = Github(auth=Auth.Token(gh_token))
-        repo = g.get_repo(repo_name)
-        remote_file = repo.get_contents("registry.json")
-        remote_reg = json.loads(remote_file.decoded_content.decode("utf-8"))
-        merged = {
-            "papers": list(dict.fromkeys(local_reg.get("papers", []) + remote_reg.get("papers", []))),
-            "hashes": list(dict.fromkeys(local_reg.get("hashes", []) + remote_reg.get("hashes", []))),
-            "titles": list(dict.fromkeys(local_reg.get("titles", []) + remote_reg.get("titles", []))),
-        }
-        save_registry(merged)
-        status("🔄 Registry synced with GitHub vault: %d existing papers known", len(merged["papers"]))
-        return merged
-    except Exception as e:
-        status("⚠️ Could not sync remote registry from GitHub: %s. Using local.", e)
-        return local_reg
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  4-LAYER DEDUPLICATION GUARD
-# ══════════════════════════════════════════════════════════════════════════════
-
-def clean_str(s: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9 ]", "", s.lower()).strip()
-
-
-def strip_arxiv_version(aid: str) -> str:
-    """Normalize '2609.04199v1' -> '2609.04199' to prevent version duplicates."""
-    return re.sub(r"v\d+$", "", aid.strip())
-
-
-base_arxiv_id = strip_arxiv_version
-
-
-def is_duplicate(arxiv_id: str, title: str, pdf_hash: str | None, reg: dict) -> str | None:
-    """Bulletproof duplicate check:
-    Layer 1: Exact or version-stripped arXiv ID
-    Layer 2: Exact normalized title match
-    Layer 3: High-similarity fuzzy title match
-    Layer 4: SHA-256 PDF hash match
-    """
-    known_papers = reg.get("papers", [])
-    known_titles = reg.get("titles", [])
-    known_hashes = reg.get("hashes", [])
-
-    # Layer 1 — arXiv ID & Base ID
-    curr_base = base_arxiv_id(arxiv_id)
-    for p in known_papers:
-        if p == arxiv_id or base_arxiv_id(p) == curr_base:
-            return f"Layer-1: ID '{arxiv_id}' matches existing '{p}'"
-
-    # Layer 2 — Exact normalized title match
-    clean_title = clean_str(title)
-    clean_known = [clean_str(t) for t in known_titles]
-    if clean_title in clean_known:
-        idx = clean_known.index(clean_title)
-        return f"Layer-2: Title matches exactly with '{known_titles[idx]}'"
-
-    # Layer 3 — Fuzzy title match
-    for existing_title in known_titles:
-        score = fuzz.ratio(clean_title, clean_str(existing_title))
-        if score >= FUZZY_THRESHOLD:
-            return f"Layer-3: Title fuzzy match {score}% vs '{existing_title}'"
-
-    # Layer 4 — PDF content SHA-256 hash
-    if pdf_hash and pdf_hash in known_hashes:
-        return f"Layer-4: Exact PDF SHA-256 ({pdf_hash[:12]}…) already in registry"
-
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ZERO-LINK SANITIZATION ENGINE (Pristine Text Guarantee)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def strip_all_links(text: str) -> str:
-    """Strip all web links (markdown links, image embeds, HTML hrefs, and raw URLs)
-    from text to ensure zero link pollution for RAG, text files, and LLM fine-tuning.
-    """
-    if not text:
-        return ""
-
-    # 1. Strip markdown image embeds: ![alt](url) -> ''
-    text = re.sub(r'!\[[^\]]*\]\([^\)]+\)', '', text)
-
-    # 2. Strip GitHub badge syntax like [![badge](url)](link)
-    text = re.sub(r'\[!\[[^\]]*\]\([^\)]+\)\]\([^\)]+\)', '', text)
-
-    # 3. Strip markdown links: [anchor](url) -> anchor
-    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-
-    # 4. Strip HTML anchor links: <a href="...">anchor</a> -> anchor
-    text = re.sub(r'<a\s+[^>]*href=[^>]*>(.*?)</a>', r'\1', text, flags=re.DOTALL | re.IGNORECASE)
-
-    # 5. Strip common HTML wrapper tags but keep text
-    text = re.sub(r'</?(?:details|summary|div|span|p)[^>]*>', '', text, flags=re.IGNORECASE)
-
-    # 6. Strip enclosed URLs: <http://...> or <https://...> -> ''
-    text = re.sub(r'<https?://[^>]+>', '', text)
-
-    # 7. Strip raw URLs: http://, https://, ftp://
-    text = re.sub(r'https?://[^\s\)\]]+', '', text)
-    text = re.sub(r'ftp://[^\s\)\]]+', '', text)
-
-    # 8. Strip web URLs starting with www.
-    text = re.sub(r'www\.[^\s\)\]]+', '', text)
-
-    # 9. Clean up empty brackets or parentheses left behind: () or []
-    text = re.sub(r'\(\s*\)', '', text)
-    text = re.sub(r'\[\s*\]', '', text)
-
-    # 10. Collapse multiple spaces and excessive empty lines
-    text = re.sub(r'[ \t]{2,}', ' ', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-
-    return text.strip()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOURCES:  arXiv RSS + Hugging Face Trending
-# ══════════════════════════════════════════════════════════════════════════════
-
-def parse_arxiv_rss(categories: list[str], limit: int = 30) -> list[PaperInfo]:
-    """Fetch papers from arXiv RSS feeds — completely bypasses export.arxiv.org API.
-    These feeds are served from a CDN and have zero rate-limiting.
-    """
-    papers: list[PaperInfo] = []
-    seen_ids: set[str] = set()
-
-    for cat in categories:
-        rss_url = f"https://rss.arxiv.org/rss/{cat}"
-        try:
-            resp = requests.get(rss_url, headers={"User-Agent": "KnowledgeBot/3.0"}, timeout=20)
-            resp.raise_for_status()
-            root = ET.fromstring(resp.content)
-
-            dc_ns = "{http://purl.org/dc/elements/1.1/}"
-
-            for item in root.findall(".//item"):
-                raw_title = (item.findtext("title") or "").strip()
-                link = (item.findtext("link") or "").strip()
-                description = (item.findtext("description") or "").strip()
-
-                arxiv_id_match = re.search(r"arxiv\.org/abs/([\d.]+)", link)
-                if not arxiv_id_match:
-                    continue
-                arxiv_id = arxiv_id_match.group(1)
-                base_id = strip_arxiv_version(arxiv_id)
-
-                if base_id in seen_ids:
-                    continue
-                seen_ids.add(base_id)
-
-                clean_title = re.sub(r"\s*\(arXiv:[\d.]+v?\d*\s*\[.*?\]\)\s*$", "", raw_title).strip()
-                if not clean_title:
-                    clean_title = raw_title
-
-                authors = (item.findtext(f"{dc_ns}creator") or "").strip()
-
-                papers.append(PaperInfo(
-                    arxiv_id=base_id,
-                    title=clean_title,
-                    abstract=description[:500],
-                    authors=authors,
-                    categories=cat,
-                    published=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                ))
-
-            status("  📡 RSS %s: fetched %d items", cat, len([p for p in papers if p.categories == cat]))
-            time.sleep(0.4)
-
-        except Exception as e:
-            status("  ⚠️ RSS feed error for %s: %s", cat, e)
-
-    return papers[:limit]
-
-
-def fetch_huggingface_trending(hf_token: str, limit: int = 20) -> list[PaperInfo]:
-    """Fetch top trending AI research papers from Hugging Face Daily Papers."""
-    papers: list[PaperInfo] = []
-    headers = {"User-Agent": "KnowledgeBot/3.0"}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
-
-    try:
-        r = requests.get("https://huggingface.co/api/daily_papers", headers=headers, timeout=20)
-        if r.status_code == 200:
-            for item in r.json()[:limit]:
-                paper_info = item.get("paper", {})
-                raw_id = paper_info.get("id")
-                if not raw_id:
-                    continue
-
-                base_id = strip_arxiv_version(raw_id)
-                title = paper_info.get("title", "Unknown")
-                abstract = paper_info.get("summary", "")[:500]
-                authors_list = paper_info.get("authors", [])
-                if isinstance(authors_list, list):
-                    authors = ", ".join(
-                        a.get("name", a) if isinstance(a, dict) else str(a)
-                        for a in authors_list[:5]
-                    )
-                else:
-                    authors = str(authors_list)
-
-                code_repo = paper_info.get("githubRepo")
-                stars = paper_info.get("githubStars")
-                upvotes = item.get("numUpvotes") or paper_info.get("upvotes")
-
-                papers.append(PaperInfo(
-                    arxiv_id=base_id,
-                    title=title,
-                    abstract=abstract,
-                    authors=authors,
-                    published=paper_info.get("publishedAt", "")[:10],
-                    code_repo=code_repo,
-                    stars=stars,
-                    upvotes=upvotes,
-                    track="🔥 Hugging Face Trending",
-                ))
-
-            status("  🔥 HF Trending: fetched %d papers (authenticated=%s)", len(papers), bool(hf_token))
-        else:
-            status("  ⚠️ HF API returned HTTP %d", r.status_code)
-    except Exception as e:
-        log.warning("Could not fetch Hugging Face trending papers: %s", e)
-
-    return papers
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  PDF DOWNLOAD & DOCLING ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
-
-def download_pdf(paper: PaperInfo, dest_dir: Path, max_retries: int = 3) -> tuple[Path, str]:
-    """Stream download PDF and compute SHA-256 hash on the fly with retry logic."""
-    safe_id = paper.arxiv_id.replace("/", "_")
-    pdf_path = dest_dir / f"{safe_id}.pdf"
-
-    for attempt in range(max_retries):
-        hasher = hashlib.sha256()
-        try:
-            with requests.get(
-                paper.pdf_url,
-                headers={"User-Agent": "KnowledgeBot/3.0"},
-                stream=True,
-                timeout=45,
-            ) as resp:
-                resp.raise_for_status()
-                with open(pdf_path, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        if chunk:
-                            f.write(chunk)
-                            hasher.update(chunk)
-            sha256 = hasher.hexdigest()
-            return pdf_path, sha256
-        except Exception as exc:
-            if pdf_path.exists():
-                pdf_path.unlink(missing_ok=True)
-            if attempt < max_retries - 1:
-                wait_sec = 2.0 * (attempt + 1)
-                log.warning("PDF download retry %d/%d for %s (%.1fs): %s", attempt + 1, max_retries, safe_id, wait_sec, exc)
-                time.sleep(wait_sec)
-            else:
-                raise exc
-
-
-_converter: DocumentConverter | None = None
-
-
-def get_converter() -> DocumentConverter:
-    """Initialize fast zero-OCR Docling converter once and reuse in memory."""
-    global _converter
-    if _converter is None:
-        log.info("Initializing fast Docling pipeline (zero-OCR digital mode)...")
-        pipeline_options = PdfPipelineOptions(do_ocr=False, do_table_structure=True)
-        _converter = DocumentConverter(
-            format_options={"pdf": PdfFormatOption(pipeline_options=pipeline_options)}
-        )
-    return _converter
-
-
-def convert_to_markdown(pdf_path: Path) -> tuple[str, int, int]:
-    """Convert PDF to structured Markdown using fast cached Docling engine."""
-    converter = get_converter()
-    result = converter.convert(str(pdf_path))
-    md_text = result.document.export_to_markdown()
-
-    word_count = len(md_text.split())
-    try:
-        page_count = len(result.document.pages)
-    except Exception:
-        page_count = max(1, word_count // 300)
-
-    return md_text, word_count, page_count
-
-
-def strip_bibliography(md_text: str) -> tuple[str, str]:
-    """Detect and separate the bibliography/references section from the main content."""
-    bib_patterns = [
-        r"^#{1,3}\s*References?\s*$",
-        r"^#{1,3}\s*Bibliography\s*$",
-        r"^#{1,3}\s*Works?\s+Cited\s*$",
-        r"^#{1,3}\s*Literature\s*$",
-        r"^\*\*References?\*\*\s*$",
-    ]
-    combined_pattern = "|".join(bib_patterns)
-    lines = md_text.split("\n")
-
-    bib_start = None
-    for i in range(len(lines) - 1, max(len(lines) // 2, 0), -1):
-        if re.match(combined_pattern, lines[i].strip(), re.IGNORECASE):
-            bib_start = i
-            break
-
-    if bib_start is not None:
-        clean_content = "\n".join(lines[:bib_start]).rstrip()
-        bibliography = "\n".join(lines[bib_start:])
-        return clean_content, bibliography
-
-    return md_text, ""
-
-
-def extract_code_repo(text: str, abstract: str = "") -> str | None:
-    """Extract first valid companion GitHub repository link found in markdown or abstract."""
-    full_text = f"{abstract}\n{text[:4000]}"
-    matches = re.findall(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", full_text, re.IGNORECASE)
-    ignored = {"docling", "pytorch", "huggingface", "tensorflow", "keras", "numpy", "scipy", "docling-project"}
-    for m in matches:
-        clean_m = m.rstrip("/").removesuffix(".git")
-        parts = clean_m.split("/")
-        if len(parts) == 2 and parts[0].lower() not in ignored and parts[1].lower() not in ignored:
-            return f"https://github.com/{clean_m}"
-    return None
-
-
-def fetch_companion_code(code_repo_url: str, gh_token: str) -> str | None:
-    """Fetch the README.md from a paper's companion GitHub repository."""
-    if not code_repo_url or not gh_token:
-        return None
-    try:
-        match = re.match(r"https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", code_repo_url)
-        if not match:
-            return None
-        repo_name = match.group(1).rstrip("/").removesuffix(".git")
-        g = Github(auth=Auth.Token(gh_token))
-        repo = g.get_repo(repo_name)
-
-        readme_content = None
-        for readme_name in ["README.md", "readme.md", "README.rst", "README"]:
-            try:
-                readme_file = repo.get_contents(readme_name)
-                readme_content = readme_file.decoded_content.decode("utf-8")
-                break
-            except GithubException:
-                continue
-
-        if readme_content:
-            return f"\n\n## Companion Repository Code (GitHub)\n\n{readme_content}"
-        return None
-    except Exception as e:
-        log.warning("Could not fetch companion code for %s: %s", code_repo_url, e)
-        return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ZERO-LINK FRONTMATTER & FULL-COVERAGE CHUNKER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def build_zero_link_frontmatter(
-    paper: PaperInfo,
-    kb_id: str,
-    word_count: int,
-    page_count: int,
-    total_chunks: int,
-) -> str:
-    """Generate pure YAML frontmatter with ZERO URLs, ensuring 100% clean RAG metadata."""
-    safe_title = paper.title.replace('"', "'")
-    safe_authors = paper.authors[:200].replace('"', "'")
-    now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-
-    return f"""---
-kb_id: "{kb_id}"
-arxiv_id: "{paper.arxiv_id}"
-title: "{safe_title}"
-track: "{paper.track}"
-categories: "{paper.categories}"
-authors: "{safe_authors}"
-published: "{paper.published}"
-ingested: "{now_iso}"
-word_count: {word_count}
-page_count: {page_count}
-total_chunks: {total_chunks}
-has_code: {str(bool(paper.code_repo)).lower()}
----
-
-"""
-
-
-def chunk_document_full_coverage(
-    clean_text: str,
-    kb_id: str,
-    paper: PaperInfo,
-    target_words_per_chunk: int = 1500,
-    overlap_words: int = 120,
-) -> list[dict]:
-    """100% Full-Coverage Smart Chunker:
-    Splits the document into natural semantic chunks (~2000 tokens) so that:
-    1. Zero text is truncated or lost during GPU fine-tuning.
-    2. GPU training does not run out of memory (OOM).
-    3. The model absorbs 100% of the paper's contents.
-    """
-    paragraphs = re.split(r"\n\s*\n", clean_text)
-    chunks_text: list[str] = []
-    curr_chunk: list[str] = []
-    curr_words = 0
-
-    for para in paragraphs:
-        p = para.strip()
-        if not p:
-            continue
-        p_words = len(p.split())
-
-        if curr_words + p_words > target_words_per_chunk and curr_chunk:
-            combined = "\n\n".join(curr_chunk)
-            chunks_text.append(combined)
-
-            # Extract overlap words from end of current chunk
-            all_words = combined.split()
-            overlap_text = " ".join(all_words[-overlap_words:]) if len(all_words) > overlap_words else ""
-            curr_chunk = [overlap_text, p] if overlap_text else [p]
-            curr_words = len(overlap_text.split()) + p_words
-        else:
-            curr_chunk.append(p)
-            curr_words += p_words
-
-    if curr_chunk:
-        chunks_text.append("\n\n".join(curr_chunk))
-
-    total_chunks = len(chunks_text)
-    records: list[dict] = []
-
-    for idx, c_text in enumerate(chunks_text, start=1):
-        chunk_id = f"{kb_id}_c{idx:02d}"
-        records.append({
-            "id": chunk_id,
-            "kb_id": kb_id,
-            "chunk_index": idx,
-            "total_chunks": total_chunks,
-            "title": paper.title,
-            "track": paper.track,
-            "categories": paper.categories,
-            "authors": paper.authors,
-            "published": paper.published,
-            "text": c_text.strip(),
-        })
-
-    return records
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  TELEGRAM DISPATCHER (Topic 354: PDF, Topic 355: Text, Topic 356: Dataset, Topic 1: General)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def tg_send(token: str, chat_id: str, text: str, **kwargs) -> requests.Response:
-    url = TELEGRAM_API.format(token=token, method="sendMessage")
-    tid = kwargs.pop("message_thread_id", None)
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", **kwargs}
-    if tid is not None:
-        try:
-            tid_int = int(tid)
-            if tid_int > 1:
-                payload["message_thread_id"] = tid_int
-        except (ValueError, TypeError):
-            pass
-    r = requests.post(url, json=payload, timeout=30)
-    r.raise_for_status()
-    return r
-
-
-def tg_send_doc(
-    token: str,
-    chat_id: str,
-    file_path: Path,
-    caption: str,
-    reply_markup: dict | None = None,
-    **kwargs,
-) -> requests.Response:
-    url = TELEGRAM_API.format(token=token, method="sendDocument")
-    tid = kwargs.pop("message_thread_id", None)
-    data = {"chat_id": chat_id, "caption": caption[:1024], "parse_mode": "HTML", **kwargs}
-    if tid is not None:
-        try:
-            tid_int = int(tid)
-            if tid_int > 1:
-                data["message_thread_id"] = tid_int
-        except (ValueError, TypeError):
-            pass
-    if reply_markup:
-        data["reply_markup"] = json.dumps(reply_markup)
-
-    with open(file_path, "rb") as f:
-        files = {"document": (file_path.name, f, "application/octet-stream")}
-        r = requests.post(url, data=data, files=files, timeout=120)
-
-    r.raise_for_status()
-    return r
-
-
-def build_pdf_card(paper: PaperInfo, kb_id: str) -> str:
-    safe_title = html.escape(paper.title.strip().replace("\n", " "))
-    authors = html.escape(paper.authors[:100])
-    abstract = html.escape(paper.abstract[:280] + "…" if len(paper.abstract) > 280 else paper.abstract)
-
-    card = (
-        f"📄 <b>[PDF: {kb_id}]</b>\n"
-        f"<b>{safe_title}</b>\n\n"
-        f"🏷 <b>Track:</b> {paper.track}\n"
-        f"👥 <i>{authors}</i> ({paper.published or 'Recent'})\n"
-        f"🗂 <code>{paper.categories}</code>\n\n"
-        f"📝 <b>Abstract:</b>\n{abstract}"
-    )
-    return card
-
-
-def build_text_card(paper: PaperInfo, kb_id: str, word_count: int, page_count: int) -> str:
-    safe_title = html.escape(paper.title.strip().replace("\n", " "))
-    card = (
-        f"📝 <b>[TEXT: {kb_id}]</b> (Clean Markdown)\n"
-        f"<b>{safe_title}</b>\n\n"
-        f"🏷 <b>Track:</b> {paper.track}\n"
-        f"📊 <b>Size:</b> {word_count:,} words | {page_count} pages\n"
-        f"✨ <b>Zero-Link Sanitized:</b> 100% pure text without URL clutter\n"
-        f"🎯 <b>RAG-Ready:</b> Metadata frontmatter included"
-    )
-    return card
-
-
-def build_dataset_card(paper: PaperInfo, kb_id: str, total_chunks: int, total_words: int) -> str:
-    safe_title = html.escape(paper.title.strip().replace("\n", " "))
-    card = (
-        f"📊 <b>[DATASET: {kb_id}]</b> (Fine-Tuning JSONL)\n"
-        f"<b>{safe_title}</b>\n\n"
-        f"🏷 <b>Track:</b> {paper.track}\n"
-        f"🧩 <b>Full Coverage:</b> {total_chunks} Chunks ({total_words:,} words total)\n"
-        f"⚡ <b>Zero Truncation:</b> Sized for 2K-4K token GPU context\n"
-        f"🤖 <b>Training Ready:</b> Compatible with Unsloth, Axolotl, LLaMA-Factory"
-    )
-    return card
-
-
-def send_general_alert(token: str, chat_id: str, text: str, general_topic: int = 1) -> None:
-    """Send health and error notifications to the General Topic (#1)."""
-    try:
-        tg_send(token, chat_id, text, message_thread_id=general_topic)
-    except Exception as e:
-        log.warning("Could not send to General Topic (%d): %s", general_topic, e)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  GITHUB DUAL-VAULT & MASTER README SYNC
-# ══════════════════════════════════════════════════════════════════════════════
-
-def push_or_update(repo, file_path: str, commit_msg: str, content: str) -> None:
-    """Safely create or update file with 404 check and sha-conflict retry."""
-    for attempt in range(3):
-        try:
-            try:
-                existing = repo.get_contents(file_path)
-                repo.update_file(file_path, commit_msg, content, existing.sha)
-                return
-            except GithubException as ge:
-                if ge.status == 404:
-                    repo.create_file(file_path, commit_msg, content)
-                    return
-                time.sleep(1.5)
-        except Exception:
-            if attempt == 2:
-                raise
-            time.sleep(1.5)
-
-
-def generate_master_readme(reg: dict, github_repo_url: str) -> str:
-    """Generate comprehensive Master README for the GitHub Vault."""
-    total_papers = len(reg.get("papers", []))
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    catalog_lines = []
-    titles = reg.get("titles", [])
-    papers = reg.get("papers", [])
-
-    for i in range(max(0, len(papers) - 30), len(papers)):
-        pid = f"KB-{i+1:04d}"
-        t = titles[i] if i < len(titles) else "Research Paper"
-        aid = papers[i]
-        catalog_lines.append(f"| `{pid}` | [{t}](text_vault/{pid}.md) | `{aid}` | [JSONL Dataset](dataset_vault/{pid}_dataset.jsonl) |")
-
-    catalog_table = "\n".join(catalog_lines) if catalog_lines else "| - | No papers registered yet | - | - |"
-    tb = chr(96) * 3
-
-    return f"""# 🧠 Knowledge Vault — Master Research & Fine-Tuning Corpus
-
-An automated, 24/7 autonomous research ingestion vault. Contains zero-link sanitized documents and 100% full-coverage chunked datasets for LLM fine-tuning.
-
-### 📊 Vault Overview
-- **Total Ingested Documents**: `{total_papers}`
-- **Last Sync**: `{now_str}`
-- **Repository**: `{github_repo_url}`
-
----
-
-## 📁 Repository Structure
-
-{tb}
-├── text_vault/              # 📝 100% Zero-Link Clean Markdown Files (RAG-Ready)
-│   ├── KB-0001.md
-│   └── ...
-├── dataset_vault/           # 📊 Full-Coverage Chunked JSONL (Fine-Tuning Ready)
-│   ├── KB-0001_dataset.jsonl
-│   └── dataset.jsonl        # Global master training dataset
-├── registry.json            # 🛡️ 4-Layer Deduplication Database
-└── README.md                # 📖 Master Catalog & Index
-{tb}
-
----
-
-## 🚀 Telegram Real-Time Delivery Topics
-
-| Content Type | Telegram Topic | Description |
-| :--- | :--- | :--- |
-| **📄 Raw PDFs** | [Topic 354](https://t.me/c/3958148223/354) | Original research PDFs |
-| **📝 Clean Text** | [Topic 355](https://t.me/c/3958148223/355) | Zero-link sanitized markdown for RAG |
-| **📊 Datasets** | [Topic 356](https://t.me/c/3958148223/356) | Chunked fine-tuning JSONL (Unsloth ready) |
-| **🚨 General / Alerts** | [Topic 1](https://t.me/c/3958148223/1) | System health, 24/7 cycle status, error alerts |
-
----
-
-## 📚 Recent Ingested Catalog
-
-| ID | Title | arXiv ID | Dataset |
-| :--- | :--- | :--- | :--- |
-{catalog_table}
-"""
-
-
-def github_save_vault(
-    gh_token: str,
-    repo_url: str,
-    kb_id: str,
-    clean_md_text: str,
-    dataset_jsonl_text: str,
-    reg: dict,
-) -> None:
-    """Push text file, dataset file, registry, and master README to GitHub Vault."""
-    repo_name = re.sub(r"https?://github\.com/", "", repo_url).rstrip("/").removesuffix(".git")
-    auth = Auth.Token(gh_token)
-    g = Github(auth=auth)
-    repo = g.get_repo(repo_name)
-
-    text_path = f"text_vault/{kb_id}.md"
-    dataset_path = f"dataset_vault/{kb_id}_dataset.jsonl"
-    reg_path = "registry.json"
-    readme_path = "README.md"
-    commit_msg = f"[{kb_id}] Ingest text & dataset into Knowledge Vault"
-
-    # Push files
-    push_or_update(repo, text_path, commit_msg, clean_md_text)
-    push_or_update(repo, dataset_path, commit_msg, dataset_jsonl_text)
-    push_or_update(repo, reg_path, commit_msg, json.dumps(reg, indent=2))
-
-    # Update Master README
-    master_readme = generate_master_readme(reg, repo_url)
-    push_or_update(repo, readme_path, f"Update Master Catalog for {kb_id}", master_readme)
-
-    log.info("GitHub: Pushed %s, %s, and updated Master README.md", text_path, dataset_path)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ID GENERATOR
-# ══════════════════════════════════════════════════════════════════════════════
-
-def next_kb_id(reg: dict) -> str:
-    n = len(reg.get("papers", [])) + 1
-    return f"KB-{n:04d}"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN PIPELINE RUNNER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run(env: dict) -> dict:
-    token = env["TELEGRAM_BOT_TOKEN"]
-    group_id = env["TELEGRAM_GROUP_ID"]
-    raw_topic = int(env.get("RAW_PDF_TOPIC_ID", 354))
-    md_topic = int(env.get("TEXT_MD_TOPIC_ID", 355))
-    dataset_topic = int(env.get("DATASET_TOPIC_ID", 356))
-    general_topic = int(env.get("GENERAL_TOPIC_ID", 1))
-
-    admin_id = env["ADMIN_CHAT_ID"]
-    gh_token = env["GITHUB_TOKEN"]
-    gh_repo = env["GITHUB_REPO_URL"]
-    hf_token = env.get("HF_TOKEN", "")
-
-    # 1. Sync remote registry from GitHub
-    reg = load_registry()
-    reg = sync_remote_registry(gh_token, gh_repo, reg)
-
-    stats = {"scanned": 0, "skipped": 0, "added": 0, "errors": 0}
-    start_time = time.time()
-    papers_per_cat = int(env.get("PAPERS_PER_CATEGORY", PAPERS_PER_CATEGORY))
-
-    status("════════════════════════════════════════════════════════════════════════════")
-    status("🧠 Knowledge Agent v3 — 24/7 Omni-Source & Full-Coverage Fine-Tuning Engine")
-    status("   • Target Topics : PDF (#%d) | Text (#%d) | Dataset (#%d) | General (#%d)",
-           raw_topic, md_topic, dataset_topic, general_topic)
-    status("   • Batch Size    : %d/track | Known Registry: %d papers", papers_per_cat, len(reg.get("papers", [])))
-    status("════════════════════════════════════════════════════════════════════════════")
-
-    # 2. Build master candidates list from all sources
-    all_batches: list[tuple[str, list[PaperInfo]]] = []
-
-    # Source 1: Hugging Face Trending
-    status("\n🔥 [Discovery] Fetching Hugging Face Daily Trending Papers...")
-    hf_papers = fetch_huggingface_trending(hf_token, limit=15)
-    if hf_papers:
-        all_batches.append(("🔥 Hugging Face Trending", hf_papers))
-
-    # Source 2: arXiv RSS Feeds
-    for track_name, categories in TECH_CURRICULUM_RSS:
-        status("\n📡 [Discovery] Fetching RSS feed for: %s", track_name)
-        rss_papers = parse_arxiv_rss(categories, limit=papers_per_cat)
-        for p in rss_papers:
-            p.track = track_name
-        if rss_papers:
-            all_batches.append((track_name, rss_papers))
-
-    # 3. Process each batch
-    for batch_name, papers in all_batches:
-        status("\n📚 [Track Processing] %s (%d candidates)", batch_name, len(papers))
-
-        for paper in papers:
-            stats["scanned"] += 1
-            status("\n  ──────────────────────────────────────────────────────────")
-            status("  🔍 [%s] %s", paper.arxiv_id, paper.title[:70])
-
-            # Pre-download Deduplication (Layers 1, 2, 3)
-            dup_reason = is_duplicate(paper.arxiv_id, paper.title, None, reg)
-            if dup_reason:
-                status("    ⏭ SKIP (Pre-download): %s", dup_reason)
-                stats["skipped"] += 1
-                continue
-
-            pdf_path: Path | None = None
-            pdf_hash: str | None = None
-
-            try:
-                # Step 1: Download PDF
-                t_dl = time.time()
-                pdf_path, pdf_hash = download_pdf(paper, PDF_DIR)
-                dl_duration = max(0.1, time.time() - t_dl)
-                pdf_size_mb = pdf_path.stat().st_size / (1024 * 1024)
-                status("    ⬇ Downloaded: %.2f MB in %.1fs (%.2f MB/s)",
-                       pdf_size_mb, dl_duration, pdf_size_mb / dl_duration)
-
-                # Step 2: Post-download Deduplication (Layer 4 — SHA-256)
-                dup_reason = is_duplicate(paper.arxiv_id, paper.title, pdf_hash, reg)
-                if dup_reason:
-                    status("    ⏭ SKIP (Hash duplicate): %s", dup_reason)
-                    stats["skipped"] += 1
-                    pdf_path.unlink(missing_ok=True)
-                    continue
-
-                # Step 3: Docling PDF Conversion
-                t_conv = time.time()
-                status("    ⚡ Converting with Docling GPU/digital engine...")
-                raw_md_text, word_count, page_count = convert_to_markdown(pdf_path)
-                conv_duration = time.time() - t_conv
-
-                if len(raw_md_text) < MIN_MD_CHARS:
-                    status("    ⏭ SKIP: Converted text too short (%d chars)", len(raw_md_text))
-                    stats["skipped"] += 1
-                    pdf_path.unlink(missing_ok=True)
-                    continue
-
-                status("    ⚡ Converted: %d words, %d pages in %.1fs", word_count, page_count, conv_duration)
-
-                # Step 4: Companion Code (Optional)
-                if not paper.code_repo:
-                    paper.code_repo = extract_code_repo(raw_md_text, paper.abstract)
-
-                code_readme = None
-                if paper.code_repo:
-                    status("    📦 Companion code detected: %s", paper.code_repo)
-                    code_readme = fetch_companion_code(paper.code_repo, gh_token)
-
-                # Step 5: Strip Bibliography & Clean Text
-                body_content, bibliography = strip_bibliography(raw_md_text)
-
-                # Append companion code if present
-                full_raw_text = body_content
-                if code_readme:
-                    full_raw_text += code_readme
-
-                # Step 6: Apply ZERO-LINK Sanitization Engine
-                status("    ✨ Sanitizing text: stripping all links, raw URLs, and badges...")
-                clean_body = strip_all_links(full_raw_text)
-
-                # Step 7: 100% Full-Coverage Smart Chunking for Fine-Tuning
-                kb_id = next_kb_id(reg)
-                paper.track = batch_name
-                chunk_records = chunk_document_full_coverage(clean_body, kb_id, paper)
-                total_chunks = len(chunk_records)
-                status(f"    🧩 Full-Coverage Chunker: Created {total_chunks} chunks (100% retained, 0% truncated)")
-
-                # Step 8: Build Zero-Link Markdown Document
-                frontmatter = build_zero_link_frontmatter(paper, kb_id, word_count, page_count, total_chunks)
-                final_clean_md = frontmatter + clean_body
-
-                # Save local files
-                md_path = TEXT_VAULT_DIR / f"{kb_id}.md"
-                md_path.write_text(final_clean_md, encoding="utf-8")
-
-                # Save dataset files
-                paper_dataset_file = DATASET_VAULT_DIR / f"{kb_id}_dataset.jsonl"
-                dataset_lines = [json.dumps(rec, ensure_ascii=False) for rec in chunk_records]
-                paper_dataset_file.write_text("\n".join(dataset_lines) + "\n", encoding="utf-8")
-
-                # Append to cumulative dataset
-                with open(GLOBAL_DATASET_FILE, "a", encoding="utf-8") as gf:
-                    gf.write("\n".join(dataset_lines) + "\n")
-
-                # Rename PDF with KB ID for delivery
-                kb_pdf_path = PDF_DIR / f"{kb_id}.pdf"
-                if pdf_path.exists():
-                    pdf_path.rename(kb_pdf_path)
-
-                # Step 9: Multi-Topic Telegram Delivery
-                status("    📤 Delivering to Telegram: PDF (#%d) | Text (#%d) | Dataset (#%d)...",
-                       raw_topic, md_topic, dataset_topic)
-
-                # Delivery A: Raw PDF -> Topic 354
-                pdf_card = build_pdf_card(paper, kb_id)
-                if kb_pdf_path.exists():
-                    if pdf_size_mb < 50:
-                        tg_send_doc(token, group_id, kb_pdf_path, pdf_card, message_thread_id=raw_topic)
-                    else:
-                        tg_send(token, group_id, pdf_card + f"\n\n📥 <i>PDF exceeds 50MB ({pdf_size_mb:.0f}MB)</i>",
-                                message_thread_id=raw_topic)
-
-                # Delivery B: Clean Text -> Topic 355
-                text_card = build_text_card(paper, kb_id, word_count, page_count)
-                tg_send_doc(token, group_id, md_path, text_card, message_thread_id=md_topic)
-
-                # Delivery C: Dataset JSONL -> Topic 356
-                dataset_card = build_dataset_card(paper, kb_id, total_chunks, word_count)
-                tg_send_doc(token, group_id, paper_dataset_file, dataset_card, message_thread_id=dataset_topic)
-
-                # Step 10: Register Paper Locally
-                reg["papers"].append(paper.arxiv_id)
-                reg["hashes"].append(pdf_hash)
-                reg["titles"].append(paper.title)
-                save_registry(reg)
-
-                # Step 11: GitHub Dual-Vault Sync (text_vault/ + dataset_vault/ + README.md)
-                try:
-                    status("    🐙 Pushing %s to GitHub Dual-Vault...", kb_id)
-                    github_save_vault(
-                        gh_token=gh_token,
-                        repo_url=gh_repo,
-                        kb_id=kb_id,
-                        clean_md_text=final_clean_md,
-                        dataset_jsonl_text="\n".join(dataset_lines) + "\n",
-                        reg=reg,
-                    )
-                    status("    🐙 GitHub Vault Sync OK")
-                except Exception as gh_exc:
-                    status("    ⚠️ GitHub push failed (non-fatal): %s", gh_exc)
-                    stats.setdefault("gh_errors", 0)
-                    stats["gh_errors"] += 1
-
-                stats["added"] += 1
-                status("    ✅ SUCCESS: %s archived and delivered!", kb_id)
-
-            except Exception as paper_exc:
-                stats["errors"] += 1
-                error_msg = f"❌ [ERROR on {paper.arxiv_id}] {paper.title[:50]}: {paper_exc}"
-                status("    %s", error_msg)
-
-                # Send error alert to General Topic (#1)
-                send_general_alert(
-                    token=token,
-                    chat_id=group_id,
-                    text=f"⚠️ <b>Ingestion Error Detected</b>\n<b>Paper:</b> {paper.arxiv_id}\n<b>Title:</b> {paper.title[:60]}\n<b>Error:</b> <code>{html.escape(str(paper_exc)[:200])}</code>",
-                    general_topic=general_topic,
-                )
-
-                # Rollback registry
-                if paper.arxiv_id in reg.get("papers", []):
-                    reg["papers"].remove(paper.arxiv_id)
-                if pdf_hash and pdf_hash in reg.get("hashes", []):
-                    reg["hashes"].remove(pdf_hash)
-                if paper.title in reg.get("titles", []):
-                    reg["titles"].remove(paper.title)
-                save_registry(reg)
-
-            finally:
-                # Cleanup temporary PDF
-                if pdf_path and pdf_path.exists():
-                    pdf_path.unlink(missing_ok=True)
-                kb_temp_pdf = PDF_DIR / f"{kb_id}.pdf"
-                if kb_temp_pdf.exists():
-                    kb_temp_pdf.unlink(missing_ok=True)
-
-        time.sleep(1.0)
-
-    total_time = round(time.time() - start_time)
-    status("\n════════════════════════════════════════════════════════════════════════════")
-    status("🎉 Cycle Complete in %ds: Scanned %d | Added %d | Skipped %d | Errors %d",
-           total_time, stats["scanned"], stats["added"], stats["skipped"], stats["errors"])
-    status("════════════════════════════════════════════════════════════════════════════")
-
-    # Send Cycle Summary to General Topic (#1)
-    summary_msg = (
-        f"🤖 <b>Knowledge Agent v3 — Cycle Complete</b>\n"
-        f"⏱ <b>Duration:</b> {total_time}s\n\n"
-        f"📊 <b>Statistics:</b>\n"
-        f"  • 🔍 Scanned: <b>{stats['scanned']}</b>\n"
-        f"  • ✅ Ingested: <b>{stats['added']}</b>\n"
-        f"  • ⏭ Skipped (Duplicates): <b>{stats['skipped']}</b>\n"
-        f"  • ⚠️ Errors: <b>{stats['errors']}</b>\n\n"
-        f"📁 <i>Text Vault, Dataset Vault, and Topics 354-356 up to date.</i>"
-    )
-    send_general_alert(token, group_id, summary_msg, general_topic)
-
-    return stats
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-DEFAULT_CONFIG = {
-    "GITHUB_TOKEN": "YOUR_GITHUB_TOKEN",
-    "GITHUB_REPO_URL": "https://github.com/Rawknowledge-database/knowledge",
-    "TELEGRAM_BOT_TOKEN": "8525850416:AAGtYIM1sg8MF21_8lI2hOS1E-i9MosV4RE",
-    "TELEGRAM_GROUP_ID": "-1003958148223",
-    "RAW_PDF_TOPIC_ID": "354",
-    "TEXT_MD_TOPIC_ID": "355",
-    "DATASET_TOPIC_ID": "356",
-    "GENERAL_TOPIC_ID": "1",
-    "ADMIN_CHAT_ID": "6190001521",
-    "HF_TOKEN": "YOUR_HF_TOKEN",
-    "PAPERS_PER_CATEGORY": "15",
-}
-
-
-def prompt_env() -> dict:
-    env_file = ROOT / ".env"
-    file_cfg = {}
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                file_cfg[k.strip()] = v.strip().strip("'\"")
-
-    colab_secrets = {}
-    try:
-        from google.colab import userdata
-        for k in DEFAULT_CONFIG.keys():
-            try:
-                secret_val = userdata.get(k)
-                if secret_val:
-                    colab_secrets[k] = str(secret_val).strip()
-            except Exception:
-                pass
+        LOCAL_REGISTRY_FILE.write_text(json.dumps(reg, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
-    env = {}
-    for k, default_v in DEFAULT_CONFIG.items():
-        val = (
-            os.environ.get(k, "").strip()
-            or colab_secrets.get(k, "")
-            or str(file_cfg.get(k, "")).strip()
-            or default_v
-        )
-        env[k] = val
-    if env.get("HF_TOKEN"):
-        os.environ["HF_TOKEN"] = env["HF_TOKEN"]
-        os.environ["HUGGING_FACE_HUB_TOKEN"] = env["HF_TOKEN"]
-    return env
+def extract_repo_name(url: str) -> str:
+    cleaned = url.rstrip("/").removesuffix(".git")
+    parts = cleaned.split("/")
+    return f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else cleaned
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  24/7 CRASH-PROOF DAEMON LOOP
-# ══════════════════════════════════════════════════════════════════════════════
-
-def daemon_loop(env: dict) -> None:
-    """Run pipeline continuously 24/7 with zero sleeping — non-stop scan, convert, and upload."""
-    cycle = 1
-
-    status("════════════════════════════════════════════════════════════════════════════")
-    status("⚡ Knowledge Agent v3 — 24/7 Autonomous Daemon Started")
-    status("   • PDF Topic     : https://t.me/c/3958148223/%s", env.get("RAW_PDF_TOPIC_ID", "354"))
-    status("   • Text Topic    : https://t.me/c/3958148223/%s", env.get("TEXT_MD_TOPIC_ID", "355"))
-    status("   • Dataset Topic : https://t.me/c/3958148223/%s", env.get("DATASET_TOPIC_ID", "356"))
-    status("   • General Topic : https://t.me/c/3958148223/%s", env.get("GENERAL_TOPIC_ID", "1"))
-    status("════════════════════════════════════════════════════════════════════════════")
-
-    # Broadcast startup to General Topic
-    token = env["TELEGRAM_BOT_TOKEN"]
-    group_id = env["TELEGRAM_GROUP_ID"]
-    general_topic = int(env.get("GENERAL_TOPIC_ID", 1))
-    send_general_alert(
-        token, group_id,
-        "🟢 <b>Knowledge Agent v3 Online (24/7 Autonomous Daemon)</b>\n"
-        "• Tracking 10 research & cyber curriculum tracks\n"
-        "• Multi-topic routing active (PDF: 354, Text: 355, Dataset: 356)\n"
-        "• Zero-Link sanitizer & Full-Coverage chunking enabled.",
-        general_topic,
-    )
-
-    while True:
-        cycle_start = time.time()
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        status("\n🚀 [Cycle #%d] Starting continuous scan at %s", cycle, now_str)
+def sync_github_registry(gh_token: str, gh_repo_url: str, local_reg: dict[str, list[str]]) -> tuple[dict[str, list[str]], int]:
+    repo_name = extract_repo_name(gh_repo_url)
+    highest_num = len(local_reg.get("papers", []))
+    try:
+        gh = Github(auth=Auth.Token(gh_token))
+        repo = gh.get_repo(repo_name)
+        try:
+            vault_files = repo.get_contents("text_vault")
+            for f in vault_files:
+                if f.name.startswith("KB-") and f.name.endswith(".md"):
+                    n = f.name[3:7]
+                    if n.isdigit():
+                        highest_num = max(highest_num, int(n))
+        except Exception:
+            pass
 
         try:
-            stats = run(env)
-            status("✅ [Cycle #%d] Completed in %ds: %s", cycle, round(time.time() - cycle_start), stats)
-        except KeyboardInterrupt:
-            status("\n🛑 Continuous engine stopped by user.")
-            send_general_alert(token, group_id, "🛑 <b>Knowledge Agent paused by user.</b>", general_topic)
+            remote_content = repo.get_contents("registry.json")
+            remote_reg = json.loads(remote_content.decoded_content.decode("utf-8"))
+            merged_papers = list(local_reg.get("papers", []))
+            merged_hashes = list(local_reg.get("hashes", []))
+            merged_titles = list(local_reg.get("titles", []))
+            for p, h, t in zip(remote_reg.get("papers", []), remote_reg.get("hashes", []), remote_reg.get("titles", [])):
+                if h not in merged_hashes:
+                    merged_papers.append(p)
+                    merged_hashes.append(h)
+                    merged_titles.append(t)
+            local_reg["papers"] = merged_papers
+            local_reg["hashes"] = merged_hashes
+            local_reg["titles"] = merged_titles
+            highest_num = max(highest_num, len(merged_papers))
+            save_local_registry(local_reg)
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning("GitHub registry notice: %s", e)
+    return local_reg, highest_num
+
+def compute_sha256(filepath: Path) -> str:
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        while chunk := f.read(131072):
+            h.update(chunk)
+    return h.hexdigest()
+
+def check_deduplication(file_hash: str | None, title: str, reg: dict[str, list[str]]) -> tuple[bool, str, str]:
+    hashes = reg.get("hashes", [])
+    titles = reg.get("titles", [])
+    if file_hash and file_hash in hashes:
+        idx = hashes.index(file_hash)
+        return True, f"KB-{idx+1:04d}", f"Binary SHA-256 match with {titles[idx]}"
+    clean_search = re.sub(r"[^\w\s]", "", title).strip().lower()
+    for idx, t in enumerate(titles):
+        clean_existing = re.sub(r"[^\w\s]", "", t).strip().lower()
+        if clean_search and clean_search == clean_existing:
+            return True, f"KB-{idx+1:04d}", f"Exact title match with '{t}'"
+        if len(clean_search) > 15 and len(clean_existing) > 15:
+            ratio = fuzz.ratio(clean_search, clean_existing)
+            token_ratio = getattr(fuzz, "token_set_ratio", fuzz.ratio)(clean_search, clean_existing)
+            if ratio >= 85 or token_ratio >= 88:
+                return True, f"KB-{idx+1:04d}", f"Fuzzy title match ({max(ratio, token_ratio)}%) with '{t}'"
+    return False, "", ""
+
+# ── Docling GPU Extraction & Zero-Link Sanitization ───────────────────────────
+_DOCLING_CONVERTER = None
+
+def get_docling_converter():
+    global _DOCLING_CONVERTER
+    if _DOCLING_CONVERTER is None:
+        try:
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+            options = PdfPipelineOptions()
+            options.do_ocr = False
+            options.do_table_structure = True
+            _DOCLING_CONVERTER = DocumentConverter(format_options={"pdf": PdfFormatOption(pipeline_options=options)})
+        except Exception:
+            from docling.document_converter import DocumentConverter
+            _DOCLING_CONVERTER = DocumentConverter()
+    return _DOCLING_CONVERTER
+
+def sanitize_markdown_zero_links(md: str) -> str:
+    md = re.sub(r'\[([^\]]+)\]\(https?://[^\)]+\)', r'\1', md)
+    md = re.sub(r'https?://\S+', '', md)
+    md = re.sub(r'!\[[^\]]*\]\([^\)]*\)', '', md)
+    md = re.sub(r'\[\s*\]', '', md)
+    return re.sub(r'\n{3,}', '\n\n', md).strip()
+
+def extract_pdf(pdf_path: Path) -> tuple[str, int]:
+    conv = get_docling_converter()
+    res = conv.convert(str(pdf_path))
+    raw_md = res.document.export_to_markdown()
+    pages = 1
+    try:
+        pages = len(getattr(res.document, "pages", [1]))
+    except Exception:
+        pass
+    return sanitize_markdown_zero_links(raw_md), max(1, pages)
+
+# ── Datasets & GitHub Vault ───────────────────────────────────────────────────
+def chunk_text(text: str, kb_id: str, title: str) -> list[dict]:
+    words = text.split()
+    records = []
+    start = 0
+    idx = 1
+    total = len(words)
+    while start < total:
+        end = min(start + 2000, total)
+        c_str = " ".join(words[start:end])
+        records.append({
+            "messages": [
+                {"role": "system", "content": f"You are an expert AI researcher analyzing document {kb_id}: '{title}'."},
+                {"role": "user", "content": f"Provide comprehensive analysis of the following section from '{title}':\n\n{c_str}"},
+                {"role": "assistant", "content": f"Here is the detailed synthesis of section {idx} from '{title}':\n\n{c_str}"}
+            ],
+            "metadata": {"kb_id": kb_id, "title": title, "chunk_index": idx, "word_count": len(words[start:end])}
+        })
+        idx += 1
+        if end >= total:
             break
-        except Exception as cycle_exc:
-            log.error("Cycle #%d encountered error: %s", cycle, cycle_exc, exc_info=True)
-            status("⚠️ [Cycle #%d] Encountered error: %s. Recovering and continuing...", cycle, cycle_exc)
-            send_general_alert(
-                token, group_id,
-                f"🚨 <b>Cycle #{cycle} Recovered from Error</b>\n<code>{html.escape(str(cycle_exc)[:250])}</code>\nRestarting scan immediately...",
-                general_topic,
-            )
+        start += 1800
+    return records
 
-        cycle += 1
-        status("🔄 Starting Cycle #%d immediately...\n", cycle)
-        time.sleep(3)
+def push_github(repo, path: str, msg: str, content: str) -> None:
+    for _ in range(3):
+        try:
+            try:
+                exist = repo.get_contents(path)
+                repo.update_file(path, msg, content, exist.sha)
+                return
+            except GithubException as ge:
+                if ge.status == 404:
+                    repo.create_file(path, msg, content)
+                    return
+                time.sleep(1.5)
+        except Exception:
+            time.sleep(1.5)
 
+def get_safe_filename(title: str, max_len: int = 120) -> str:
+    s = re.sub(r'[:/\\?*"<>|]', " - ", title)
+    s = re.sub(r"\s+", " ", s).strip(" .-_")
+    if not s:
+        s = "Document"
+    if len(s) > max_len:
+        s = s[:max_len].rsplit(" ", 1)[0].strip()
+    return s
+
+def commit_vault(kb_id: str, title: str, clean_md: str, dataset: str, reg: dict[str, list[str]]) -> bool:
+    try:
+        gh = Github(auth=Auth.Token(GITHUB_TOKEN))
+        repo = gh.get_repo(extract_repo_name(GITHUB_REPO_URL))
+        safe_title = get_safe_filename(title)
+        push_github(repo, f"text_vault/{safe_title}.md", f"feat: {kb_id} {safe_title[:50]}", clean_md)
+        push_github(repo, f"dataset_vault/{safe_title}_dataset.jsonl", f"feat: {kb_id} dataset", dataset)
+        push_github(repo, "registry.json", f"chore: register {kb_id}", json.dumps(reg, indent=2, ensure_ascii=False))
+        return True
+    except Exception as e:
+        log.error("GitHub commit failed: %s", e)
+        return False
+
+# ── Telethon Client & Topic Messaging ─────────────────────────────────────────
+client = TelegramClient("colab_session", TELEGRAM_API_ID, TELEGRAM_API_HASH)
+
+def estimate_eta(bytes_len: int, mode: str) -> int:
+    mb = bytes_len / (1024 * 1024)
+    return int(max(1, mb * 0.4) + max(4, mb * 1.5) + (15 if mode == "deep" else 0) + 4)
+
+def get_topic(msg) -> int | None:
+    if not msg.reply_to:
+        return 1 if getattr(getattr(msg, "chat", None), "forum", False) else None
+    h = msg.reply_to
+    return h.reply_to_top_id or h.reply_to_msg_id if isinstance(h, MessageReplyHeader) else None
+
+async def send_topic(topic_id: int, text: str, file_path: Path | None = None, buttons=None):
+    try:
+        if file_path and file_path.exists():
+            return await client.send_file(TELEGRAM_GROUP_ID, str(file_path), caption=text[:1024], reply_to=topic_id, parse_mode="html")
+        return await client.send_message(TELEGRAM_GROUP_ID, text, reply_to=topic_id, buttons=buttons, parse_mode="html")
+    except Exception as e:
+        log.error("Send topic error (%d): %s", topic_id, e)
+
+# ── Sequential Worker ─────────────────────────────────────────────────────────
+async def process_job(job: IngestionJob):
+    state.active_job = job
+    start_t = time.time()
+    temp_pdf = TEMP_DIR / f"{job.job_id}_{job.file_name}"
+    abort_btn = [[Button.inline("⏹️ Abort / Stop Processing", data=f"abort_{job.job_id}".encode())]]
+
+    try:
+        # Step 1: Download
+        last_edit = 0
+        async def dl_progress(cur, tot):
+            nonlocal last_edit
+            now = time.time()
+            if now - last_edit > 2.0 and tot > 0:
+                last_edit = now
+                card = f"🔄 <b>[INGESTING]</b> <code>{html.escape(job.file_name)}</code>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📥 Downloading: {int((cur/tot)*100)}% ({cur/(1024*1024):.1f}/{tot/(1024*1024):.1f} MB)\n⚙️ Docling GPU: Pending\n🐙 GitHub & Topics: Pending\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⏱️ Elapsed: {int(now - start_t)}s"
+                if job.control_msg_id:
+                    try:
+                        await client.edit_message(TELEGRAM_GROUP_ID, job.control_msg_id, card, buttons=abort_btn, parse_mode="html")
+                    except Exception:
+                        pass
+
+        await client.download_media(job.media_obj, file=str(temp_pdf), progress_callback=dl_progress)
+        if job.cancelled:
+            return
+
+        # Step 2: Deduplication Check
+        pdf_hash = compute_sha256(temp_pdf)
+        raw_title = Path(job.file_name).stem.replace("_", " ").replace("-", " ")
+        is_dup, dup_id, dup_reason = check_deduplication(pdf_hash, raw_title, state.registry)
+        if is_dup:
+            if job.control_msg_id:
+                await client.edit_message(TELEGRAM_GROUP_ID, job.control_msg_id, f"⚠️ <b>[DUPLICATE SKIPPED]</b>\n📄 <code>{html.escape(job.file_name)}</code>\n🛡️ Matches <code>{dup_id}</code> ({html.escape(dup_reason)})\n<i>Skipped to save GPU time and prevent duplicates.</i>", parse_mode="html")
+            return
+
+        # Step 3: Docling Extraction
+        state.highest_kb_num += 1
+        kb_id = f"KB-{state.highest_kb_num:04d}"
+        if job.control_msg_id:
+            await client.edit_message(TELEGRAM_GROUP_ID, job.control_msg_id, f"🔄 <b>[INGESTING {kb_id}]</b>\n📥 Download: ✅\n⚙️ Docling GPU OCR & Extraction: ⏳ Running...", buttons=abort_btn, parse_mode="html")
+
+        loop = asyncio.get_running_loop()
+        clean_md, pages = await loop.run_in_executor(None, extract_pdf, temp_pdf)
+        title = raw_title
+        words = len(clean_md.split())
+        chunks = chunk_text(clean_md, kb_id, title)
+        dataset_content = "\n".join([json.dumps(c, ensure_ascii=False) for c in chunks]) + "\n"
+
+        # Local files named with actual title
+        safe_title = get_safe_filename(title)
+        temp_md = TEMP_DIR / f"{safe_title}.md"
+        temp_md.write_text(f"---\nkb_id: \"{kb_id}\"\ntitle: \"{title}\"\npages: {pages}\nwords: {words}\n---\n\n{clean_md}", encoding="utf-8")
+        temp_dset = TEMP_DIR / f"{safe_title}_dataset.jsonl"
+        temp_dset.write_text(dataset_content, encoding="utf-8")
+        temp_pdf_named = TEMP_DIR / f"{safe_title}.pdf"
+        shutil.copy2(temp_pdf, temp_pdf_named)
+
+        # Step 4: Deliver to Topics with actual names
+        await send_topic(RAW_PDF_TOPIC_ID, f"📄 <b>[PDF] {html.escape(title)}</b>\n\n🆔 <code>{kb_id}</code>\n📊 {job.file_size_bytes/(1024*1024):.2f} MB | {pages} pages", file_path=temp_pdf_named)
+        await send_topic(TEXT_MD_TOPIC_ID, f"📝 <b>[TEXT] {html.escape(title)}</b>\n\n🆔 <code>{kb_id}</code>\n📊 {words:,} words | {pages} pages\n✨ Zero-link sanitized", file_path=temp_md)
+        await send_topic(DATASET_TOPIC_ID, f"📊 <b>[DATASET] {html.escape(title)}</b>\n\n🆔 <code>{kb_id}</code>\n🧩 {len(chunks)} Chunks | Unsloth & LLaMA-Factory ready", file_path=temp_dset)
+
+        # Step 5: Update Registry & GitHub
+        state.registry["papers"].append(f"tg_{job.file_name}")
+        state.registry["hashes"].append(pdf_hash)
+        state.registry["titles"].append(title)
+        save_local_registry(state.registry)
+        gh_ok = await loop.run_in_executor(None, commit_vault, kb_id, title, clean_md, dataset_content, state.registry)
+
+        # Mirror to Registry Topic 649 & General 1
+        await send_topic(REGISTRY_TOPIC_ID, f"📚 <b>[REGISTRY UPDATE — {kb_id}]</b>\n<b>Title:</b> {html.escape(title)}\n📊 Vault Total: <code>{len(state.registry['papers'])}</code>\n🔒 SHA256: <code>{pdf_hash}</code>\n🐙 GitHub: {'✅ Pushed' if gh_ok else 'Local only'}")
+        await send_topic(GENERAL_TOPIC_ID, f"📢 <b>[VAULT INGESTION]</b>\n✅ Archived: <code>{kb_id}</code> — <i>{html.escape(title[:70])}</i>\n📚 Total Documents: <code>{len(state.registry['papers'])}</code>")
+
+        # Completion Card in Topic 648
+        dur = round(time.time() - start_t, 1)
+        final_msg = f"✅ <b>[INGESTION COMPLETE — {kb_id}]</b>\n\n📄 <b>{html.escape(title)}</b>\n⏱️ Time: {dur}s\n📊 {words:,} words | {pages} pages | {len(chunks)} chunks\n\n📦 <b>Delivered To:</b>\n  • 📄 PDF -> Topic #354\n  • 📝 TEXT -> Topic #355\n  • 📊 DATASET -> Topic #356\n  • 📚 REGISTRY -> Topic #649"
+        if job.control_msg_id:
+            await client.edit_message(TELEGRAM_GROUP_ID, job.control_msg_id, final_msg, parse_mode="html")
+    except Exception as e:
+        log.exception("Error: %s", e)
+        if job.control_msg_id:
+            await client.edit_message(TELEGRAM_GROUP_ID, job.control_msg_id, f"❌ <b>Ingestion Error:</b> <code>{html.escape(str(e))}</code>", parse_mode="html")
+    finally:
+        # Zero Disk Accumulation: delete raw PDF immediately
+        if temp_pdf.exists():
+            temp_pdf.unlink(missing_ok=True)
+        if 'temp_pdf_named' in locals() and temp_pdf_named.exists():
+            temp_pdf_named.unlink(missing_ok=True)
+        if 'temp_md' in locals() and temp_md.exists():
+            temp_md.unlink(missing_ok=True)
+        if 'temp_dset' in locals() and temp_dset.exists():
+            temp_dset.unlink(missing_ok=True)
+        state.active_job = None
+
+async def worker_loop():
+    while True:
+        try:
+            if not state.is_paused:
+                job = await state.queue.get()
+                await process_job(job)
+                state.queue.task_done()
+            await asyncio.sleep(1.0)
+        except Exception:
+            await asyncio.sleep(2.0)
+
+# ── Telegram Handlers ─────────────────────────────────────────────────────────
+@client.on(events.NewMessage)
+async def on_message(event):
+    msg = event.message
+    if event.chat_id != TELEGRAM_GROUP_ID and not event.is_private:
+        return
+    t_id = get_topic(msg)
+    txt = (msg.text or "").strip()
+
+    if txt.startswith("/status"):
+        await event.reply(f"📊 <b>[STATUS]</b>\n📚 Registered: <code>{len(state.registry['papers'])}</code>\n🆔 Next ID: <code>KB-{state.highest_kb_num + 1:04d}</code>\n⚡ Queue: {'⏸️ Paused' if state.is_paused else '🟢 Active'} ({state.queue.qsize()} waiting)\n🎛️ Mode: <code>{state.current_mode.upper()}</code>", parse_mode="html")
+        return
+    elif txt.startswith("/pause"):
+        state.is_paused = True
+        await event.reply("⏸️ Queue paused.", parse_mode="html")
+        return
+    elif txt.startswith("/resume"):
+        state.is_paused = False
+        await event.reply("▶️ Queue resumed.", parse_mode="html")
+        return
+    elif txt.startswith("/mode"):
+        state.current_mode = "auto" if state.current_mode == "interactive" else "interactive"
+        await event.reply(f"🎛️ Mode switched to <b>{state.current_mode.upper()}</b>", parse_mode="html")
+        return
+
+    # PDF Upload in Topic 648
+    if not event.is_private and t_id != UPLOAD_TOPIC_ID:
+        return
+    doc = msg.document
+    if not doc:
+        return
+
+    fname = "document.pdf"
+    for a in getattr(doc, "attributes", []):
+        if hasattr(a, "file_name") and a.file_name:
+            fname = a.file_name
+            break
+
+    if not fname.lower().endswith(".pdf"):
+        return
+
+    fsize = getattr(doc, "size", 0)
+    job_id = f"job_{int(time.time()*1000)}"
+    eta = estimate_eta(fsize, "deep")
+
+    # Duplicate pre-check
+    raw_title = Path(fname).stem.replace("_", " ").replace("-", " ")
+    is_dup, dup_id, dup_reason = check_deduplication(None, raw_title, state.registry)
+    if is_dup:
+        await msg.reply(f"⚠️ <b>[DUPLICATE DETECTED]</b>\n<code>{html.escape(fname)}</code> matches <code>{dup_id}</code>.\nSkipped to prevent duplicate storage.", parse_mode="html")
+        return
+
+    job = IngestionJob(job_id=job_id, message_id=msg.id, topic_id=t_id or UPLOAD_TOPIC_ID, chat_id=event.chat_id, file_name=fname, file_size_bytes=fsize, media_obj=msg.media, eta_seconds=eta)
+
+    if state.current_mode == "auto":
+        ctrl = await msg.reply(f"📄 <b>[QUEUED — AUTO INGEST]</b>\n<b>File:</b> <code>{html.escape(fname)}</code> ({fsize/(1024*1024):.2f} MB)\n⏱️ ETA: ~{eta}s", buttons=[[Button.inline("⏹️ Abort", data=f"abort_{job_id}".encode())]], parse_mode="html")
+        job.control_msg_id = ctrl.id
+        await state.queue.put(job)
+    else:
+        state.pending_interactive[job_id] = job
+        ctrl = await msg.reply(f"📄 <b>[DOCUMENT RECEIVED — USER CONTROL]</b>\n<b>File:</b> <code>{html.escape(fname)}</code> ({fsize/(1024*1024):.2f} MB)\n⏱️ ETA: ~{eta}s\n\nSelect processing mode:", buttons=[
+            [Button.inline("▶️ Ingest (Deep SFT)", data=f"start_deep_{job_id}".encode()), Button.inline("⚡ Fast (Chunks)", data=f"start_fast_{job_id}".encode())],
+            [Button.inline("❌ Cancel", data=f"cancel_{job_id}".encode())]
+        ], parse_mode="html")
+        job.control_msg_id = ctrl.id
+
+@client.on(events.CallbackQuery)
+async def on_callback(event):
+    data = event.data.decode("utf-8")
+    if data.startswith("start_"):
+        _, mode, j_id = data.split("_", 2)
+        job = state.pending_interactive.pop(j_id, None)
+        if job:
+            job.mode = mode
+            await event.edit(f"⏳ <b>[QUEUED]</b> <code>{html.escape(job.file_name)}</code>\nMode: {mode.upper()} | ETA: ~{job.eta_seconds}s", buttons=[[Button.inline("⏹️ Abort", data=f"abort_{job.job_id}".encode())]], parse_mode="html")
+            await state.queue.put(job)
+    elif data.startswith("cancel_"):
+        state.pending_interactive.pop(data.removeprefix("cancel_"), None)
+        await event.edit("❌ Ingestion cancelled.", parse_mode="html")
+    elif data.startswith("abort_"):
+        j_id = data.removeprefix("abort_")
+        if state.active_job and state.active_job.job_id == j_id:
+            state.active_job.cancelled = True
+        await event.edit("⏹️ Aborted.", parse_mode="html")
+
+# ── Main Runner ───────────────────────────────────────────────────────────────
+async def main():
+    state.registry = load_local_registry()
+    await client.start(bot_token=TELEGRAM_BOT_TOKEN)
+    state.registry, state.highest_kb_num = sync_github_registry(GITHUB_TOKEN, GITHUB_REPO_URL, state.registry)
+    log.info("Knowledge Bot Ready! %d papers in registry.", len(state.registry['papers']))
+    asyncio.create_task(worker_loop())
+    await send_topic(GENERAL_TOPIC_ID, f"🤖 <b>[KNOWLEDGE BOT ONLINE — T4 GPU READY]</b>\n📚 Total Documents: <code>{len(state.registry['papers'])}</code>\nDrop PDFs in Topic #648 to begin!")
+    await send_topic(UPLOAD_TOPIC_ID, f"🚀 <b>[USER CONTROL CENTER READY]</b>\nDrop any PDF here (up to 2GB) to convert and archive!")
+    await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    collected_env = prompt_env()
-    if "--once" in sys.argv or os.environ.get("RUN_ONCE", "").lower() in ("true", "1", "yes"):
-        try:
-            run(collected_env)
-        except KeyboardInterrupt:
-            print("\n🛑 Pipeline paused by user. Clean exit.")
-    else:
-        daemon_loop(collected_env)
+    asyncio.run(main())

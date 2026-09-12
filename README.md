@@ -51,11 +51,13 @@ A high-performance, **rate-limit-immune**, 24/7 autonomous research ingestion pi
                                          ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                          MULTI-DESTINATION DISPATCH                             │
-│   • 📱 Telegram:                                                                │
-│       - 📄 Raw PDFs    -> Topic 354 (https://t.me/c/3958148223/354)             │
-│       - 📝 Clean Text  -> Topic 355 (https://t.me/c/3958148223/355)             │
-│       - 📊 Datasets    -> Topic 356 (https://t.me/c/3958148223/356)             │
-│       - 🚨 Alerts      -> Topic 1   (https://t.me/c/3958148223/1)               │
+│   • 📱 Telegram Topics:                                                         │
+│       - 🚀 Upload & Control -> Topic 648 (https://t.me/c/3958148223/648)        │
+│       - 📚 Registry Mirror  -> Topic 649 (https://t.me/c/3958148223/649)        │
+│       - 📄 Raw PDFs         -> Topic 354 (https://t.me/c/3958148223/354)        │
+│       - 📝 Clean Text       -> Topic 355 (https://t.me/c/3958148223/355)        │
+│       - 📊 Datasets         -> Topic 356 (https://t.me/c/3958148223/356)        │
+│       - 📢 General & Alerts -> Topic 1   (https://t.me/c/3958148223/1)          │
 │   • 🐙 GitHub Dual-Vault: text_vault/ + dataset_vault/ + Master README.md       │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```

@@ -1,10 +1,16 @@
 # PDF & binary downloads
 raw_pdfs/
+channel_raw_pdfs/
 *.pdf
 
-# Runtime logs
+# Runtime logs & temp
 logs/
 *.log
+temp_*/
+
+# Telethon Sessions
+*.session
+*.session-journal
 
 # Fine-tuning dataset and vault files (stored in dedicated storage repo)
 *.jsonl
@@ -27,6 +33,17 @@ ENV/
 
 # Configuration & Secrets
 .env
+.env.cyber
+.env.*
+!.env.example
+!.env.cyber.example
+
+# Cyber vault & binary downloads
+cyber_raw_pdfs/
+cyber_text_vault/*.md
+cyber_dataset_vault/*.jsonl
+cyber_logs/
+cyber_registry.json
 
 # Operating System & IDE
 .DS_Store
