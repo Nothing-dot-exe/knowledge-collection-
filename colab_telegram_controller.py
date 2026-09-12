@@ -83,6 +83,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("ColabController")
 
+# Silence noisy Docling internal layout post-processor warnings and HTTP noise
+for _noisy in [
+    "docling",
+    "MatchingPostProcessor",
+    "docling.pipeline",
+    "docling.models",
+    "docling.datamodel",
+    "docling.document_converter",
+    "urllib3",
+    "telethon",
+]:
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
+
+# Prevent asyncio GC task destruction by holding strong references
+_ACTIVE_TASKS: set[asyncio.Task] = set()
+
+def create_monitored_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _ACTIVE_TASKS.add(task)
+    task.add_done_callback(_ACTIVE_TASKS.discard)
+    return task
+
 # Ensure UTF-8 output on Windows
 if sys.platform == "win32":
     try:
@@ -1109,6 +1131,9 @@ async def scan_channel_backlog():
             curr_id += batch_size
             await asyncio.sleep(0.5)
 
+        except asyncio.CancelledError:
+            log.info("Channel backlog scanner cancelled gracefully.")
+            break
         except Exception as e:
             log.warning("Channel scanner loop warning: %s", e)
             await asyncio.sleep(10)
@@ -1418,13 +1443,18 @@ async def main():
     await send_to_topic(GENERAL_TOPIC_ID, startup_card)
     await send_to_topic(UPLOAD_TOPIC_ID, startup_card)
 
-    # Start the sequential 1-by-1 worker task and channel scanner
-    worker_task = asyncio.create_task(queue_worker_loop())
-    scanner_task = asyncio.create_task(scan_channel_backlog())
+    # Start the sequential 1-by-1 worker task and channel scanner with strong references
+    w_task = create_monitored_task(queue_worker_loop())
+    s_task = create_monitored_task(scan_channel_backlog())
 
     # Keep client running
     log.info("🟢 Controller fully running and listening for Telegram events.")
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        w_task.cancel()
+        s_task.cancel()
+        await asyncio.gather(w_task, s_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
@@ -1440,7 +1470,7 @@ if __name__ == "__main__":
         if "running event loop" in str(re).lower():
             # Fallback for Jupyter / Colab notebooks
             loop = asyncio.get_event_loop()
-            loop.create_task(main())
+            create_monitored_task(main())
         else:
             raise
     except (KeyboardInterrupt, SystemExit):

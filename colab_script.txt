@@ -82,6 +82,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("ColabController")
 
+# Silence noisy Docling internal layout post-processor warnings and HTTP noise
+for _noisy in [
+    "docling",
+    "MatchingPostProcessor",
+    "docling.pipeline",
+    "docling.models",
+    "docling.datamodel",
+    "docling.document_converter",
+    "urllib3",
+    "telethon",
+]:
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
+
+# Prevent asyncio GC task destruction by holding strong references
+_ACTIVE_TASKS: set[asyncio.Task] = set()
+
+def create_monitored_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _ACTIVE_TASKS.add(task)
+    task.add_done_callback(_ACTIVE_TASKS.discard)
+    return task
+
 # Colab Paths
 BASE_DIR = Path.cwd()
 TEMP_DIR = BASE_DIR / "temp_colab"
@@ -510,6 +532,7 @@ async def process_job(job: IngestionJob):
         state.active_job = None
 
 async def worker_loop():
+    log.info("Queue Worker Loop started. Waiting for ingestion tasks...")
     while True:
         try:
             if not state.is_paused:
@@ -517,7 +540,11 @@ async def worker_loop():
                 await process_job(job)
                 state.queue.task_done()
             await asyncio.sleep(1.0)
-        except Exception:
+        except asyncio.CancelledError:
+            log.info("Worker loop cancelled gracefully.")
+            break
+        except Exception as e:
+            log.error("Worker loop exception: %s", e)
             await asyncio.sleep(2.0)
 
 async def scan_channel_backlog():
@@ -601,6 +628,9 @@ async def scan_channel_backlog():
             curr_id += batch_size
             await asyncio.sleep(0.5)
 
+        except asyncio.CancelledError:
+            log.info("Channel backlog scanner cancelled gracefully.")
+            break
         except Exception as e:
             log.warning("Channel scanner loop warning: %s", e)
             await asyncio.sleep(10)
@@ -734,11 +764,20 @@ async def main():
     state.registry, state.highest_kb_num = sync_github_registry(GITHUB_TOKEN, GITHUB_REPO_URL, state.registry)
     gh_status = "Connected" if GITHUB_TOKEN else "Token Missing"
     log.info("Knowledge Bot Ready! %d papers in registry. GitHub: %s", len(state.registry['papers']), gh_status)
-    asyncio.create_task(worker_loop())
-    asyncio.create_task(scan_channel_backlog())
+    
+    # Store strong references so Python GC never destroys pending tasks
+    w_task = create_monitored_task(worker_loop())
+    s_task = create_monitored_task(scan_channel_backlog())
+    
     await send_topic(GENERAL_TOPIC_ID, f"🤖 <b>[KNOWLEDGE BOT ONLINE — T4 GPU READY]</b>\n📚 Total Documents: <code>{len(state.registry['papers'])}</code>\n📡 Monitored Channel: <code>@{SOURCE_CHANNEL_USERNAME}</code> (Continuous Backlog & Real-time Ingestion)\nDrop PDFs in Topic #648 for manual ingestion!")
     await send_topic(UPLOAD_TOPIC_ID, f"🚀 <b>[USER CONTROL CENTER READY]</b>\n📡 Ingesting PDFs from <code>@{SOURCE_CHANNEL_USERNAME}</code> 1-by-1.\nDrop any PDF here (up to 2GB) to convert and archive!")
-    await client.run_until_disconnected()
+    
+    try:
+        await client.run_until_disconnected()
+    finally:
+        w_task.cancel()
+        s_task.cancel()
+        await asyncio.gather(w_task, s_task, return_exceptions=True)
 
 if __name__ == "__main__":
     try:
@@ -751,7 +790,7 @@ if __name__ == "__main__":
     except RuntimeError as re:
         if "running event loop" in str(re).lower():
             loop = asyncio.get_event_loop()
-            loop.create_task(main())
+            create_monitored_task(main())
         else:
             raise
     except (KeyboardInterrupt, SystemExit):
