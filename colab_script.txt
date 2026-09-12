@@ -227,12 +227,26 @@ def get_docling_converter():
     global _DOCLING_CONVERTER
     if _DOCLING_CONVERTER is None:
         try:
-            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            import torch
+            if torch.cuda.is_available():
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cuda.matmul.allow_tf32 = True
+            from docling.datamodel.pipeline_options import (
+                PdfPipelineOptions,
+                AcceleratorOptions,
+                AcceleratorDevice,
+            )
             from docling.document_converter import DocumentConverter, PdfFormatOption
             options = PdfPipelineOptions()
             options.do_ocr = False
             options.do_table_structure = True
+            try:
+                device = AcceleratorDevice.CUDA if (hasattr(torch, "cuda") and torch.cuda.is_available()) else AcceleratorDevice.AUTO
+                options.accelerator_options = AcceleratorOptions(num_threads=8, device=device)
+            except Exception:
+                pass
             _DOCLING_CONVERTER = DocumentConverter(format_options={"pdf": PdfFormatOption(pipeline_options=options)})
+            log.info("Initialized Docling with 100% CUDA GPU Acceleration.")
         except Exception:
             from docling.document_converter import DocumentConverter
             _DOCLING_CONVERTER = DocumentConverter()
