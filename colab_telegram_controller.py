@@ -29,6 +29,23 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+import subprocess
+import sys
+
+# ── Auto-install missing dependencies on Google Colab or fresh env ─────────────
+for _mod, _pkg in [
+    ("github", "PyGithub>=2.1.0"),
+    ("telethon", "telethon>=1.36.0"),
+    ("docling", "docling>=2.0.0"),
+    ("thefuzz", "thefuzz>=0.22.0"),
+    ("requests", "requests>=2.28.0"),
+    ("dotenv", "python-dotenv>=1.0.0"),
+]:
+    try:
+        __import__(_mod)
+    except ImportError:
+        print(f"📦 Installing required package '{_pkg}'...", flush=True)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", _pkg])
 
 # Load environment variables if .env exists
 try:
