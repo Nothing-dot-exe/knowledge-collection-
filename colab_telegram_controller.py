@@ -101,7 +101,7 @@ TEMP_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_REGISTRY_FILE = BASE_DIR / "registry.json"
 
 # Telegram Credentials
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8525850416:AAGtYIM1sg8MF21_8lI2hOS1E-i9MosV4RE")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8405366649:AAGU5HqMhuj7Uh2WlSF_jxNDwETv_mY2ClY")
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "32962732"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "2b6abfa8621f5a53b2d0a3a79d3bf739")
 TELEGRAM_GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1003958148223"))
@@ -159,6 +159,8 @@ class AgentState:
         self.registry: dict[str, list[str]] = {"papers": [], "hashes": [], "titles": []}
         self.highest_kb_num: int = 0
         self.start_time: float = time.time()
+        self.processed_msg_ids: set[int] = set()
+        self.scanned_channel_max_id: int = 0
 
 state = AgentState()
 
@@ -656,7 +658,7 @@ def commit_vault_to_github(
 #  TELETHON MTPROTO CLIENT & TELEGRAM DELIVERY
 # ══════════════════════════════════════════════════════════════════════════════
 
-client = TelegramClient("colab_controller_session", TELEGRAM_API_ID, TELEGRAM_API_HASH)
+client = TelegramClient(f"colab_bot_{TELEGRAM_BOT_TOKEN.split(':')[0]}", TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
 
 def estimate_processing_time(file_size_bytes: int, mode: str) -> int:
@@ -1025,6 +1027,93 @@ async def queue_worker_loop():
             await asyncio.sleep(3.0)
 
 
+async def scan_channel_backlog():
+    """Continuously monitors and scans default channel @mybooksaspdf starting from ID 1 for PDFs, enqueuing them 1-by-1."""
+    await asyncio.sleep(3.0)
+    log.info("📡 Initializing backlog scanner for default channel @%s...", SOURCE_CHANNEL_USERNAME)
+    try:
+        channel = await client.get_entity(SOURCE_CHANNEL_ID)
+    except Exception:
+        try:
+            channel = await client.get_entity(SOURCE_CHANNEL_USERNAME)
+        except Exception as e:
+            log.error("Could not resolve channel @%s: %s", SOURCE_CHANNEL_USERNAME, e)
+            return
+
+    curr_id = 1
+    batch_size = 50
+    empty_streak = 0
+
+    while True:
+        try:
+            ids = list(range(curr_id, curr_id + batch_size))
+            msgs = await client.get_messages(channel, ids=ids)
+            valid = [m for m in msgs if m]
+
+            if not valid:
+                empty_streak += 1
+                if empty_streak >= 3:
+                    await asyncio.sleep(20)
+                    empty_streak = 0
+                    continue
+                else:
+                    curr_id += batch_size
+                    await asyncio.sleep(0.5)
+                    continue
+
+            empty_streak = 0
+            for m in valid:
+                if m.id in state.processed_msg_ids:
+                    continue
+                if not m.file or not m.file.name or not m.file.name.lower().endswith(".pdf"):
+                    continue
+
+                state.processed_msg_ids.add(m.id)
+                fname = m.file.name
+                fsize = m.file.size or 0
+                raw_title = Path(fname).stem.replace("_", " ").replace("-", " ")
+
+                # Deduplication pre-check against current registry
+                is_dup, dup_id, dup_reason = check_deduplication(None, raw_title, state.registry)
+                if is_dup:
+                    log.info("Channel PDF skipped (matches %s): %s", dup_id, fname)
+                    continue
+
+                eta = estimate_processing_time(fsize, "deep")
+                job_id = f"chan_{m.id}_{int(time.time())}"
+                job = IngestionJob(
+                    job_id=job_id,
+                    message_id=m.id,
+                    topic_id=UPLOAD_TOPIC_ID,
+                    chat_id=m.chat_id,
+                    file_name=fname,
+                    file_size_bytes=fsize,
+                    media_obj=m.media,
+                    mode="deep",
+                    eta_seconds=eta,
+                )
+                chan_notice = (
+                    f"📡 <b>[FOUND IN @{SOURCE_CHANNEL_USERNAME}]</b>\n\n"
+                    f"📄 <b>File:</b> <code>{html.escape(fname)}</code>\n"
+                    f"📊 <b>Size:</b> {fsize/(1024*1024):.2f} MB | ⏱️ <b>ETA:</b> ~{eta}s\n"
+                    f"⏳ <b>Queue Position:</b> {state.queue.qsize() + 1}\n\n"
+                    f"<i>Queued for 1-by-1 CUDA processing. Original remains safe in channel.</i>"
+                )
+                abort_btn = [[Button.inline("⏹️ Abort / Stop Processing", data=f"abort_{job.job_id}".encode())]]
+                ctrl_msg = await send_to_topic(UPLOAD_TOPIC_ID, chan_notice, buttons=abort_btn)
+                if ctrl_msg:
+                    job.control_msg_id = ctrl_msg.id
+                await state.queue.put(job)
+                log.info("Enqueued channel PDF #%d: %s", m.id, fname)
+
+            curr_id += batch_size
+            await asyncio.sleep(0.5)
+
+        except Exception as e:
+            log.warning("Channel scanner loop warning: %s", e)
+            await asyncio.sleep(10)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  TELEGRAM EVENT LISTENERS: USER CONTROL (TOPIC 648)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1190,6 +1279,9 @@ async def message_handler(event):
     )
 
     if is_source_channel:
+        if msg.id in state.processed_msg_ids:
+            return
+        state.processed_msg_ids.add(msg.id)
         # Channel documents are queued automatically for 1-by-1 processing
         chan_notice = (
             f"📡 <b>[NEW BOOK IN @{SOURCE_CHANNEL_USERNAME}]</b>\n\n"
@@ -1326,8 +1418,9 @@ async def main():
     await send_to_topic(GENERAL_TOPIC_ID, startup_card)
     await send_to_topic(UPLOAD_TOPIC_ID, startup_card)
 
-    # Start the sequential 1-by-1 worker task
+    # Start the sequential 1-by-1 worker task and channel scanner
     worker_task = asyncio.create_task(queue_worker_loop())
+    scanner_task = asyncio.create_task(scan_channel_backlog())
 
     # Keep client running
     log.info("🟢 Controller fully running and listening for Telegram events.")

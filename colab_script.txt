@@ -89,7 +89,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_REGISTRY_FILE = BASE_DIR / "registry.json"
 
 # Credentials & Topic IDs
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8525850416:AAGtYIM1sg8MF21_8lI2hOS1E-i9MosV4RE")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8405366649:AAGU5HqMhuj7Uh2WlSF_jxNDwETv_mY2ClY")
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "32962732"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "2b6abfa8621f5a53b2d0a3a79d3bf739")
 TELEGRAM_GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1003958148223"))
@@ -142,6 +142,8 @@ class AgentState:
         self.registry: dict[str, list[str]] = {"papers": [], "hashes": [], "titles": []}
         self.highest_kb_num: int = 0
         self.start_time: float = time.time()
+        self.processed_msg_ids: set[int] = set()
+        self.scanned_channel_max_id: int = 0
 
 state = AgentState()
 
@@ -393,7 +395,7 @@ def commit_vault(kb_id: str, title: str, clean_md: str, dataset: str, reg: dict[
         return False
 
 # ── Telethon Client & Topic Messaging ─────────────────────────────────────────
-client = TelegramClient("colab_session", TELEGRAM_API_ID, TELEGRAM_API_HASH)
+client = TelegramClient(f"colab_bot_{TELEGRAM_BOT_TOKEN.split(':')[0]}", TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
 def estimate_eta(bytes_len: int, mode: str) -> int:
     mb = bytes_len / (1024 * 1024)
@@ -518,6 +520,91 @@ async def worker_loop():
         except Exception:
             await asyncio.sleep(2.0)
 
+async def scan_channel_backlog():
+    """Continuously monitors and scans @mybooksaspdf starting from ID 1 for PDFs, enqueuing them 1-by-1."""
+    await asyncio.sleep(3.0)
+    log.info("📡 Initializing backlog scanner for default channel @%s...", SOURCE_CHANNEL_USERNAME)
+    try:
+        channel = await client.get_entity(SOURCE_CHANNEL_ID)
+    except Exception:
+        try:
+            channel = await client.get_entity(SOURCE_CHANNEL_USERNAME)
+        except Exception as e:
+            log.error("Could not resolve channel @%s: %s", SOURCE_CHANNEL_USERNAME, e)
+            return
+
+    curr_id = 1
+    batch_size = 50
+    empty_streak = 0
+
+    while True:
+        try:
+            ids = list(range(curr_id, curr_id + batch_size))
+            msgs = await client.get_messages(channel, ids=ids)
+            valid = [m for m in msgs if m]
+
+            if not valid:
+                empty_streak += 1
+                if empty_streak >= 3:
+                    await asyncio.sleep(20)
+                    empty_streak = 0
+                    continue
+                else:
+                    curr_id += batch_size
+                    await asyncio.sleep(0.5)
+                    continue
+
+            empty_streak = 0
+            for m in valid:
+                if m.id in state.processed_msg_ids:
+                    continue
+                if not m.file or not m.file.name or not m.file.name.lower().endswith(".pdf"):
+                    continue
+
+                state.processed_msg_ids.add(m.id)
+                fname = m.file.name
+                fsize = m.file.size or 0
+                raw_title = Path(fname).stem.replace("_", " ").replace("-", " ")
+
+                # Deduplication pre-check against current registry
+                is_dup, dup_id, dup_reason = check_deduplication(None, raw_title, state.registry)
+                if is_dup:
+                    log.info("Channel PDF skipped (matches %s): %s", dup_id, fname)
+                    continue
+
+                eta = estimate_eta(fsize, "auto")
+                job_id = f"chan_{m.id}_{int(time.time())}"
+                job = IngestionJob(
+                    job_id=job_id,
+                    message_id=m.id,
+                    topic_id=UPLOAD_TOPIC_ID,
+                    chat_id=m.chat_id,
+                    file_name=fname,
+                    file_size_bytes=fsize,
+                    media_obj=m.media,
+                    mode="auto",
+                    eta_seconds=eta,
+                )
+                card = (
+                    f"📡 <b>[FOUND IN @{SOURCE_CHANNEL_USERNAME}]</b>\n\n"
+                    f"📄 <b>File:</b> <code>{html.escape(fname)}</code>\n"
+                    f"📊 <b>Size:</b> {fsize/(1024*1024):.2f} MB | ⏱️ <b>ETA:</b> ~{eta}s\n"
+                    f"⏳ <b>Queue Position:</b> {state.queue.qsize() + 1}\n\n"
+                    f"<i>Queued for 1-by-1 CUDA processing. Original remains safe.</i>"
+                )
+                ctrl = await send_topic(UPLOAD_TOPIC_ID, card, buttons=[[Button.inline("⏹️ Abort", data=f"abort_{job_id}".encode())]])
+                if ctrl:
+                    job.control_msg_id = ctrl.id
+                await state.queue.put(job)
+                log.info("Enqueued channel PDF #%d: %s", m.id, fname)
+
+            curr_id += batch_size
+            await asyncio.sleep(0.5)
+
+        except Exception as e:
+            log.warning("Channel scanner loop warning: %s", e)
+            await asyncio.sleep(10)
+
 # ── Telegram Handlers ─────────────────────────────────────────────────────────
 @client.on(events.NewMessage)
 async def on_message(event):
@@ -593,6 +680,9 @@ async def on_message(event):
     job = IngestionJob(job_id=job_id, message_id=msg.id, topic_id=UPLOAD_TOPIC_ID, chat_id=event.chat_id, file_name=fname, file_size_bytes=fsize, media_obj=msg.media, eta_seconds=eta)
 
     if is_source_channel:
+        if msg.id in state.processed_msg_ids:
+            return
+        state.processed_msg_ids.add(msg.id)
         chan_card = (
             f"📡 <b>[NEW BOOK IN @{SOURCE_CHANNEL_USERNAME}]</b>\n\n"
             f"📄 <b>File:</b> <code>{html.escape(fname)}</code>\n"
@@ -645,8 +735,9 @@ async def main():
     gh_status = "Connected" if GITHUB_TOKEN else "Token Missing"
     log.info("Knowledge Bot Ready! %d papers in registry. GitHub: %s", len(state.registry['papers']), gh_status)
     asyncio.create_task(worker_loop())
-    await send_topic(GENERAL_TOPIC_ID, f"🤖 <b>[KNOWLEDGE BOT ONLINE — T4 GPU READY]</b>\n📚 Total Documents: <code>{len(state.registry['papers'])}</code>\nDrop PDFs in Topic #648 to begin!")
-    await send_topic(UPLOAD_TOPIC_ID, f"🚀 <b>[USER CONTROL CENTER READY]</b>\nDrop any PDF here (up to 2GB) to convert and archive!")
+    asyncio.create_task(scan_channel_backlog())
+    await send_topic(GENERAL_TOPIC_ID, f"🤖 <b>[KNOWLEDGE BOT ONLINE — T4 GPU READY]</b>\n📚 Total Documents: <code>{len(state.registry['papers'])}</code>\n📡 Monitored Channel: <code>@{SOURCE_CHANNEL_USERNAME}</code> (Continuous Backlog & Real-time Ingestion)\nDrop PDFs in Topic #648 for manual ingestion!")
+    await send_topic(UPLOAD_TOPIC_ID, f"🚀 <b>[USER CONTROL CENTER READY]</b>\n📡 Ingesting PDFs from <code>@{SOURCE_CHANNEL_USERNAME}</code> 1-by-1.\nDrop any PDF here (up to 2GB) to convert and archive!")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
