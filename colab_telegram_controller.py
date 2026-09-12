@@ -38,6 +38,7 @@ for _mod, _pkg in [
     ("github", "PyGithub>=2.1.0"),
     ("telethon", "telethon>=1.36.0"),
     ("docling", "docling>=2.0.0"),
+    ("pypdf", "pypdf>=4.0.0"),
     ("thefuzz", "thefuzz>=0.22.0"),
     ("requests", "requests>=2.28.0"),
     ("dotenv", "python-dotenv>=1.0.0"),
@@ -430,12 +431,13 @@ def get_docling_converter():
 
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_ocr = False
-        pipeline_options.do_table_structure = True
+        # Disable heavy TableFormer vision model: saves ~10GB RAM and speeds up extraction 5-10x
+        pipeline_options.do_table_structure = False
 
-        # Enforce full CUDA GPU acceleration
+        # Enforce CUDA GPU acceleration with balanced worker threads
         try:
             device = AcceleratorDevice.CUDA if (hasattr(torch, "cuda") and torch.cuda.is_available()) else AcceleratorDevice.AUTO
-            pipeline_options.accelerator_options = AcceleratorOptions(num_threads=8, device=device)
+            pipeline_options.accelerator_options = AcceleratorOptions(num_threads=4, device=device)
         except Exception:
             pass
 
@@ -444,7 +446,7 @@ def get_docling_converter():
                 "pdf": PdfFormatOption(pipeline_options=pipeline_options)
             }
         )
-        log.info("Initialized Docling Converter with 100% CUDA GPU Acceleration.")
+        log.info("Initialized Docling Converter with CUDA GPU Acceleration (TableFormer disabled for low RAM).")
     except Exception as e:
         log.warning("Could not initialize Docling with CUDA options, falling back to default: %s", e)
         try:
@@ -472,6 +474,25 @@ def sanitize_markdown_zero_links(md: str) -> str:
     return md.strip()
 
 
+def extract_pdf_fallback(pdf_path: Path) -> tuple[str, int]:
+    """Lightweight fallback using pypdf for maximum resilience and low memory."""
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(str(pdf_path))
+        pages_count = len(reader.pages)
+        text_parts = []
+        for i, page in enumerate(reader.pages):
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                text_parts.append(f"## Page {i+1}\n\n{page_text.strip()}")
+        raw_md = "\n\n".join(text_parts)
+        clean_md = sanitize_markdown_zero_links(raw_md)
+        return clean_md, max(1, pages_count)
+    except Exception as e:
+        log.error("pypdf fallback extraction failed: %s", e)
+        return f"# {pdf_path.stem}\n\n[Content extraction unavailable]", 1
+
+
 def extract_pdf_with_docling(pdf_path: Path) -> tuple[str, int]:
     """Convert PDF using Docling. Returns (clean_markdown, estimated_pages)."""
     converter = get_docling_converter()
@@ -492,6 +513,19 @@ def extract_pdf_with_docling(pdf_path: Path) -> tuple[str, int]:
 
     clean_md = sanitize_markdown_zero_links(raw_md)
     return clean_md, max(1, pages)
+
+
+def extract_pdf(pdf_path: Path) -> tuple[str, int]:
+    """Primary extraction with Docling GPU; graceful fallback to pypdf on any error."""
+    try:
+        clean_md, pages = extract_pdf_with_docling(pdf_path)
+        if clean_md.strip() and len(clean_md.split()) > 20:
+            return clean_md, pages
+        log.warning("Docling returned sparse text; falling back to pypdf...")
+    except Exception as e:
+        log.warning("Docling extraction failed (%s); switching to resilient pypdf fallback...", e)
+
+    return extract_pdf_fallback(pdf_path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -938,15 +972,15 @@ async def process_job(job: IngestionJob) -> None:
             except Exception:
                 pass
 
-        # Execute Docling in executor thread to prevent blocking asyncio event loop
+        # Execute extraction in executor thread to prevent blocking asyncio event loop
         loop = asyncio.get_running_loop()
-        clean_md, pages = await loop.run_in_executor(None, extract_pdf_with_docling, temp_pdf)
+        clean_md, pages = await loop.run_in_executor(None, extract_pdf, temp_pdf)
 
         # Detect genuine document title (filters out <!-- image -->, comments, and OCR tags)
         title = extract_clean_title(clean_md, job.file_name)
 
         words = len(clean_md.split())
-        log.info("[%s] Docling extraction complete: %d words, %d pages, title: '%s'", kb_id, words, pages, title)
+        log.info("[%s] Extraction complete: %d words, %d pages, title: '%s'", kb_id, words, pages, title)
 
         if job.cancelled:
             return
@@ -1120,6 +1154,16 @@ async def process_job(job: IngestionJob) -> None:
         log.info("Cleaned up temporary disk files for %s.", job.job_id)
         state.active_job = None
 
+        # 🧹 Immediately garbage collect memory and clear CUDA VRAM
+        try:
+            import gc
+            gc.collect()
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
 
 async def queue_worker_loop():
     """Background worker processing jobs strictly 1-by-1 sequentially."""
@@ -1131,6 +1175,7 @@ async def queue_worker_loop():
                 continue
 
             job = await state.queue.get()
+            state.active_job = job
             log.info("Dequeued job %s: %s", job.job_id, job.file_name)
             await process_job(job)
             state.queue.task_done()
@@ -1577,13 +1622,12 @@ if __name__ == "__main__":
         pass
 
     try:
-        asyncio.run(main())
-    except RuntimeError as re:
-        if "running event loop" in str(re).lower():
-            # Fallback for Jupyter / Colab notebooks
-            loop = asyncio.get_event_loop()
-            create_monitored_task(main())
-        else:
-            raise
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        loop.run_until_complete(main())
     except (KeyboardInterrupt, SystemExit):
         log.info("Shutdown initiated by user.")
