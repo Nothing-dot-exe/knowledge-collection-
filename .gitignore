@@ -6,6 +6,11 @@ raw_pdfs/
 logs/
 *.log
 
+# Fine-tuning dataset and vault files (stored in dedicated storage repo)
+*.jsonl
+text_vault/*.md
+dataset_vault/*.jsonl
+
 # Python cache & build
 __pycache__/
 *.py[cod]
@@ -22,7 +27,6 @@ ENV/
 
 # Configuration & Secrets
 .env
-.dashboard_config.json
 
 # Operating System & IDE
 .DS_Store

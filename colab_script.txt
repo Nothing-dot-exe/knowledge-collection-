@@ -1,3 +1,23 @@
+# ==============================================================================
+# 🧠 Knowledge Agent v3 — 24/7 Omni-Source & Full-Coverage Fine-Tuning Engine
+# ==============================================================================
+# HOW TO RUN IN GOOGLE COLAB:
+# 1. Open https://colab.research.google.com and create a New Notebook.
+# 2. Set GPU runtime: Runtime -> Change runtime type -> T4 GPU (recommended).
+# 3. Copy everything from this file and paste it into a code cell.
+# 4. Press Shift + Enter to run!
+#
+# • ZERO LINKS: 100% sanitized markdown files with zero URL pollution.
+# • 100% FULL COVERAGE: Chunks documents into 2K-token JSONL chunks (0% GPU truncation).
+# • TOPIC ROUTING:
+#     - 📄 PDFs     -> Topic 354 (https://t.me/c/3958148223/354)
+#     - 📝 Text     -> Topic 355 (https://t.me/c/3958148223/355)
+#     - 📊 Datasets -> Topic 356 (https://t.me/c/3958148223/356)
+#     - 🚨 General  -> Topic 1   (https://t.me/c/3958148223/1)
+# • GITHUB DUAL-VAULT: text_vault/ + dataset_vault/ + Master README.md
+# • 24/7 CRASH-PROOF: Automatic error recovery with instant alerts to Topic 1.
+# ==============================================================================
+
 """
 🧠 Knowledge Agent v3 — 24/7 Omni-Source RAG & Full-Coverage Fine-Tuning Engine
 ================================================================================
